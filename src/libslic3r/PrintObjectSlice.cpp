@@ -2,7 +2,12 @@
 
 #include <tbb/parallel_for.h>
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+
 #include "ClipperUtils.hpp"
+#include "Color.hpp"
 #include "ElephantFootCompensation.hpp"
 #include "I18N.hpp"
 #include "Layer.hpp"
@@ -848,14 +853,88 @@ static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCance
     // Returns MM segmentation based on painting in MM segmentation gizmo
     std::vector<std::vector<ExPolygons>> segmentation = multi_material_segmentation_by_painting(print_object, throw_on_cancel);
     assert(segmentation.size() == print_object.layer_count());
+    const size_t num_extruders = print_object.print()->config().filament_diameter.size();
+
+    auto process_weights_for_color = [](ColorSynthesisMode mode, const std::string &color) {
+        std::array<float, 4> weights{0.f, 0.f, 0.f, 0.f};
+
+        ColorRGB rgb = ColorRGB::WHITE();
+        decode_color(color, rgb);
+
+        float c = 1.f - rgb.r();
+        float m = 1.f - rgb.g();
+        float y = 1.f - rgb.b();
+
+        switch (mode) {
+        case ColorSynthesisMode::CMY:
+            weights = {c, m, y, 0.f};
+            break;
+        case ColorSynthesisMode::CMYK: {
+            const float k = std::min({c, m, y});
+            weights = {c - k, m - k, y - k, k};
+            break;
+        }
+        case ColorSynthesisMode::CMYW:
+            weights = {c, m, y, std::min({rgb.r(), rgb.g(), rgb.b()})};
+            break;
+        case ColorSynthesisMode::Standard:
+        default:
+            break;
+        }
+
+        for (float &weight : weights)
+            weight = std::max(0.f, weight);
+        return weights;
+    };
+
+    auto choose_process_channel = [](const std::array<float, 4> &weights, size_t channels, size_t layer_id, size_t target_extruder_id) {
+        float total = 0.f;
+        for (size_t channel = 0; channel < channels; ++channel)
+            total += weights[channel];
+        if (total <= 0.001f)
+            return int(-1);
+
+        const float phase = std::fmod(float(layer_id) * 0.61803398875f + float(target_extruder_id) * 0.38196601125f, 1.f);
+        const float needle = phase * total;
+        float cumulative = 0.f;
+        for (size_t channel = 0; channel < channels; ++channel) {
+            cumulative += weights[channel];
+            if (needle <= cumulative)
+                return int(channel);
+        }
+        return int(channels - 1);
+    };
+
+    const ColorSynthesisMode color_synthesis_mode = print_object.print()->config().color_synthesis_mode.value;
+    const int synthesis_channels = color_synthesis_channel_count(color_synthesis_mode);
+    if (synthesis_channels > 0 && num_extruders >= size_t(synthesis_channels)) {
+        std::vector<std::array<float, 4>> target_weights(num_extruders);
+        const std::vector<std::string> &filament_colours = print_object.print()->config().filament_colour.values;
+        for (size_t extruder_id = 0; extruder_id < num_extruders; ++extruder_id) {
+            const std::string color = extruder_id < filament_colours.size() ? filament_colours[extruder_id] : std::string("#FFFFFF");
+            target_weights[extruder_id] = process_weights_for_color(color_synthesis_mode, color);
+        }
+
+        for (size_t layer_id = 0; layer_id < segmentation.size(); ++layer_id) {
+            std::vector<ExPolygons> process_segmentation(num_extruders);
+            for (size_t target_extruder_id = 0; target_extruder_id < std::min(num_extruders, segmentation[layer_id].size()); ++target_extruder_id) {
+                if (segmentation[layer_id][target_extruder_id].empty())
+                    continue;
+
+                const int channel = choose_process_channel(target_weights[target_extruder_id], size_t(synthesis_channels), layer_id, target_extruder_id);
+                if (channel >= 0)
+                    append(process_segmentation[size_t(channel)], std::move(segmentation[layer_id][target_extruder_id]));
+            }
+            segmentation[layer_id] = std::move(process_segmentation);
+        }
+    }
+
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, segmentation.size(), std::max(segmentation.size() / 128, size_t(1))),
-        [&print_object, &segmentation, throw_on_cancel](const tbb::blocked_range<size_t> &range) {
+        [&print_object, &segmentation, throw_on_cancel, num_extruders](const tbb::blocked_range<size_t> &range) {
             const auto  &layer_ranges   = print_object.shared_regions()->layer_ranges;
             double       z              = print_object.get_layer(int(range.begin()))->slice_z;
             auto         it_layer_range = layer_range_first(layer_ranges, z);
-            // BBS
-            const size_t num_extruders = print_object.print()->config().filament_diameter.size();
 
             struct ByExtruder {
                 ExPolygons  expolygons;

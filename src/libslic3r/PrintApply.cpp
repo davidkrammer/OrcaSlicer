@@ -1585,6 +1585,14 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
                 if (used_facet_states[state_idx])
                     painting_extruders.emplace_back(state_idx);
             }
+
+            const int synthesis_channels = color_synthesis_channel_count(m_config.color_synthesis_mode.value);
+            if (synthesis_channels > 0 && num_extruders >= synthesis_channels) {
+                painting_extruders.clear();
+                const size_t first_extruder_state = static_cast<size_t>(EnforcerBlockerType::Extruder1);
+                for (size_t state_idx = first_extruder_state; state_idx < first_extruder_state + size_t(synthesis_channels); ++state_idx)
+                    painting_extruders.emplace_back(unsigned(state_idx));
+            }
         }
         if (model_object_status.print_object_regions_status == ModelObjectStatus::PrintObjectRegionsStatus::Valid) {
             // Verify that the trafo for regions & volume bounding boxes thus for regions is still applicable.

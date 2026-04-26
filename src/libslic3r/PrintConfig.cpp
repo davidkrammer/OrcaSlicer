@@ -230,6 +230,14 @@ static t_config_enum_values s_keys_map_SlicingMode {
 };
 CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(SlicingMode)
 
+static t_config_enum_values s_keys_map_ColorSynthesisMode {
+    { "standard", int(ColorSynthesisMode::Standard) },
+    { "cmy",      int(ColorSynthesisMode::CMY) },
+    { "cmyk",     int(ColorSynthesisMode::CMYK) },
+    { "cmyw",     int(ColorSynthesisMode::CMYW) }
+};
+CONFIG_OPTION_ENUM_DEFINE_STATIC_MAPS(ColorSynthesisMode)
+
 static t_config_enum_values s_keys_map_SupportMaterialPattern {
     { "rectilinear",        smpRectilinear },
     { "rectilinear-grid",   smpRectilinearGrid },
@@ -2059,6 +2067,23 @@ void PrintConfigDef::init_fff_params()
     def->gui_type = ConfigOptionDef::GUIType::color;
     def->mode = comAdvanced;
     def->set_default_value(new ConfigOptionStrings{ "#F2754E" });
+
+    def = this->add("color_synthesis_mode", coEnum);
+    def->label = L("Color slicing mode");
+    def->tooltip = L("Standard uses normal filament assignment and color painting. "
+                     "CMY, CMYK, and CMYW treat the first filament slots as process-color channels "
+                     "and convert painted colors into layer-dithered process-color tool changes.");
+    def->enum_keys_map = &ConfigOptionEnum<ColorSynthesisMode>::get_enum_values();
+    def->enum_values.emplace_back("standard");
+    def->enum_values.emplace_back("cmy");
+    def->enum_values.emplace_back("cmyk");
+    def->enum_values.emplace_back("cmyw");
+    def->enum_labels.emplace_back(L("Standard"));
+    def->enum_labels.emplace_back("CMY");
+    def->enum_labels.emplace_back("CMYK");
+    def->enum_labels.emplace_back("CMYW");
+    def->mode = comSimple;
+    def->set_default_value(new ConfigOptionEnum<ColorSynthesisMode>(ColorSynthesisMode::Standard));
 
     def           = this->add("thumb0", coStrings);
     def->label    = L("small thumb");

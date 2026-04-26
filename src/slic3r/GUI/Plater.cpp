@@ -701,6 +701,8 @@ struct Sidebar::priv
     wxPanel* m_panel_filament_content;
     wxScrolledWindow* m_scrolledWindow_filament_content;
     wxStaticLine* m_staticline2;
+    ComboBox* m_color_synthesis_combo = nullptr;
+    std::vector<std::string> m_color_synthesis_enum_values;
     wxPanel* m_panel_project_title;
     ScalableButton* m_filament_icon = nullptr;
     Button * m_flushing_volume_btn = nullptr;
@@ -1628,6 +1630,59 @@ Sidebar::Sidebar(Plater *parent)
     wxSizer *sizer_filaments2 = new wxBoxSizer(wxVERTICAL);
     sizer_filaments2->AddSpacer(FromDIP(16));
     sizer_filaments2->Add(p->sizer_filaments, 0, wxEXPAND, 0);
+    {
+        auto *mode_panel = new StaticBox(p->m_panel_filament_content, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL | wxBORDER_NONE);
+        mode_panel->SetCornerRadius(8);
+
+        auto *mode_sizer = new wxBoxSizer(wxHORIZONTAL);
+        auto *mode_label = new wxStaticText(mode_panel, wxID_ANY, _L("Color slicing"));
+        mode_label->SetFont(Label::Body_14);
+
+        p->m_color_synthesis_combo = new ComboBox(mode_panel, wxID_ANY, wxString(""), wxDefaultPosition, {-1, FromDIP(30)}, 0, nullptr, wxCB_READONLY);
+        p->m_color_synthesis_enum_values.clear();
+
+        const ConfigOptionDef *mode_def = print_config_def.get("color_synthesis_mode");
+        if (mode_def) {
+            for (const std::string &label : mode_def->enum_labels)
+                p->m_color_synthesis_combo->AppendString(_L(label));
+            p->m_color_synthesis_enum_values = mode_def->enum_values;
+        }
+
+        if (p->m_color_synthesis_enum_values.empty()) {
+            p->m_color_synthesis_combo->AppendString(_L("Standard"));
+            p->m_color_synthesis_combo->AppendString("CMY");
+            p->m_color_synthesis_combo->AppendString("CMYK");
+            p->m_color_synthesis_combo->AppendString("CMYW");
+            p->m_color_synthesis_enum_values = {"standard", "cmy", "cmyk", "cmyw"};
+        }
+
+        const ConfigOption *current_mode_opt = wxGetApp().preset_bundle->project_config.option("color_synthesis_mode");
+        const std::string current_mode = current_mode_opt ? current_mode_opt->serialize() : std::string("standard");
+        auto current_mode_it = std::find(p->m_color_synthesis_enum_values.begin(), p->m_color_synthesis_enum_values.end(), current_mode);
+        p->m_color_synthesis_combo->Select(current_mode_it == p->m_color_synthesis_enum_values.end() ? 0 : int(std::distance(p->m_color_synthesis_enum_values.begin(), current_mode_it)));
+        p->m_color_synthesis_combo->SetToolTip(_L("Standard keeps normal filament assignment and painting. CMY modes use filament slots 1-3 or 1-4 as process-color channels."));
+        p->m_color_synthesis_combo->Bind(wxEVT_COMBOBOX, [this, parent](wxCommandEvent &) {
+            const int selection = p->m_color_synthesis_combo->GetSelection();
+            if (selection < 0 || size_t(selection) >= p->m_color_synthesis_enum_values.size())
+                return;
+
+            ColorSynthesisMode mode = ColorSynthesisMode::Standard;
+            if (!ConfigOptionEnum<ColorSynthesisMode>::from_string(p->m_color_synthesis_enum_values[size_t(selection)], mode))
+                return;
+
+            wxGetApp().preset_bundle->project_config.set_key_value("color_synthesis_mode", new ConfigOptionEnum<ColorSynthesisMode>(mode));
+            wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
+            wxGetApp().plater()->update_project_dirty_from_presets();
+            wxPostEvent(parent, SimpleEvent(EVT_SCHEDULE_BACKGROUND_PROCESS, parent));
+        });
+
+        mode_sizer->Add(mode_label, 0, wxLEFT | wxRIGHT | wxALIGN_CENTER_VERTICAL, FromDIP(10));
+        mode_sizer->Add(p->m_color_synthesis_combo, 1, wxRIGHT | wxEXPAND, FromDIP(10));
+        mode_panel->SetSizer(mode_sizer);
+
+        sizer_filaments2->AddSpacer(FromDIP(8));
+        sizer_filaments2->Add(mode_panel, 0, wxEXPAND | wxLEFT | wxRIGHT, FromDIP(4));
+    }
     sizer_filaments2->AddSpacer(FromDIP(16));
     p->m_panel_filament_content->SetSizer(sizer_filaments2);
     p->m_panel_filament_content->Layout();
