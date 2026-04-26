@@ -279,7 +279,7 @@ Model Model::read_from_file(const std::string&                                  
                         result = obj_import_vertex_color_deal(vertex_filament_ids, first_extruder_id, & model);
                     }
                 }
-            } else if (obj_info.face_colors.size() > 0 && obj_info.has_uv_png == false) { // mtl file
+            } else if (obj_info.face_colors.size() > 0) { // mtl file or texture-sampled mtl
                 std::vector<unsigned char> face_filament_ids;
                 if (objFn) { // 1.result is ok and pop up a dialog
                     objFn(obj_info.face_colors, obj_info.is_single_mtl, face_filament_ids, first_extruder_id);
