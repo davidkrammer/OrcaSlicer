@@ -16,6 +16,43 @@ This fork is based on Snapmaker Orca 2.3.2 and keeps the normal Snapmaker Orca w
 
 The process-color bake is inspired by Primed3D's dithered export flow: https://github.com/3DRev/Primed3D. No Primed3D source code was copied; this implementation is independent inside Orca's slicing pipeline.
 
+## How To Use Textured OBJ Color Slicing
+
+### 1. Keep The OBJ, MTL, And Texture Together
+
+For a textured OBJ, keep the `.obj`, `.mtl`, and texture image in the same folder before importing. The OBJ references the MTL, and the MTL references the texture image.
+
+<img src="docs/images/needed-files.png" alt="Required OBJ, MTL, and PNG files" width="320">
+
+### 2. Import The OBJ
+
+Drag the `.obj` into Snapmaker Orca Color. If the matching `.mtl` and texture image are present, the model imports with full-color virtual face colors. The viewport preview keeps the real texture colors instead of forcing the model into only the physical filament colors.
+
+<img src="docs/images/imported-colored-obj.png" alt="Imported textured parrot OBJ with full-color preview" width="720">
+
+### 3. Choose A Color Slicing Mode
+
+The **Color slicing** selector appears below the filament selector only for models that contain texture-derived colors.
+
+<img src="docs/images/coloring-modes.png" alt="Color slicing modes in the filament sidebar" width="520">
+
+- **Standard** keeps the normal Snapmaker Orca slicing workflow.
+- **CMY** converts the virtual colors into cyan, magenta, and yellow process-color material bands.
+- **CMYK** adds black for darker regions and shadow detail.
+- **CMYW** adds white for brighter regions and highlight control.
+
+For CMY use three process-color filaments. For CMYK or CMYW use four process-color filaments. The fork locks the filament colors for the selected process mode so the slicer uses the correct physical colors.
+
+### 4. Slice And Inspect The Result
+
+After slicing, preview the tool/material changes before printing. The color texture is converted into process-color bands using the actual generated slicer Z heights, so changing layer height changes the generated color banding.
+
+<img src="docs/images/sliced-object.png" alt="Sliced parrot with process-color material preview and prime tower" width="720">
+
+Use the detail view to inspect whether fine texture regions are being converted into the expected material transitions.
+
+<img src="docs/images/sliced-object-detail.png" alt="Detailed close-up of process-color sliced layers" width="720">
+
 ## Download
 
 Download the latest fork build from:
