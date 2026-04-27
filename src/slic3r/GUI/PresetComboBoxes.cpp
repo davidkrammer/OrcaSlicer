@@ -58,6 +58,19 @@ namespace GUI {
 
 #define BORDER_W 10
 
+static bool is_process_filament_colour_locked(int filament_idx)
+{
+    if (filament_idx < 0 || !wxGetApp().preset_bundle)
+        return false;
+
+    const ConfigOption *mode_opt = wxGetApp().preset_bundle->project_config.option("color_synthesis_mode");
+    ColorSynthesisMode mode = ColorSynthesisMode::Standard;
+    if (mode_opt)
+        ConfigOptionEnum<ColorSynthesisMode>::from_string(mode_opt->serialize(), mode);
+
+    return filament_idx < color_synthesis_channel_count(mode);
+}
+
 // ---------------------------------
 // ***  PresetComboBox  ***
 // ---------------------------------
@@ -756,6 +769,9 @@ PlaterPresetComboBox::PlaterPresetComboBox(wxWindow *parent, Preset::Type preset
         clr_picker = new wxBitmapButton(parent, wxID_ANY, {}, wxDefaultPosition, wxSize(FromDIP(20), FromDIP(20)), wxBU_EXACTFIT | wxBU_AUTODRAW | wxBORDER_NONE);
         clr_picker->SetToolTip(_L("Click to select filament color"));
         clr_picker->Bind(wxEVT_BUTTON, [this](wxCommandEvent& e) {
+            if (is_process_filament_colour_locked(m_filament_idx))
+                return;
+
             m_clrData.SetColour(clr_picker->GetBackgroundColour());
             m_clrData.SetChooseFull(true);
             m_clrData.SetChooseAlpha(false);
@@ -938,6 +954,9 @@ bool PlaterPresetComboBox::switch_to_tab()
 
 void PlaterPresetComboBox::change_extruder_color()
 {
+    if (is_process_filament_colour_locked(m_filament_idx))
+        return;
+
     // get current color
     DynamicPrintConfig* cfg = &wxGetApp().preset_bundle->project_config;
     auto colors = static_cast<ConfigOptionStrings*>(cfg->option("filament_colour")->clone());
@@ -987,7 +1006,7 @@ void PlaterPresetComboBox::show_edit_menu()
     // To edit extruder color from the sidebar
     if (m_type == Preset::TYPE_FILAMENT) {
         append_menu_item(menu, wxID_ANY, _devL("Change extruder color"), "",
-            [this](wxCommandEvent&) { this->change_extruder_color(); }, "blank_14", menu, []() { return true; }, wxGetApp().plater());
+            [this](wxCommandEvent&) { this->change_extruder_color(); }, "blank_14", menu, [this]() { return !is_process_filament_colour_locked(m_filament_idx); }, wxGetApp().plater());
         wxGetApp().plater()->PopupMenu(menu);
         return;
     }
@@ -1029,6 +1048,9 @@ void PlaterPresetComboBox::update()
         wxColor clr(filament_color);
         clr_picker->SetBackgroundColour(clr);
         clr_picker->SetBitmap(*get_extruder_color_icons(true)[m_filament_idx]);
+        clr_picker->SetToolTip(is_process_filament_colour_locked(m_filament_idx) ?
+            _L("This process-color slot is locked by the selected color slicing mode.") :
+            _L("Click to select filament color"));
 #ifdef __WXOSX__
         clr_picker->SetLabel(clr_picker->GetLabel()); // Let setBezelStyle: be called
         clr_picker->Refresh();

@@ -1,12 +1,22 @@
 #include "../libslic3r.h"
 #include "../Model.hpp"
+#include "../PNGReadWrite.hpp"
 #include "../TriangleMesh.hpp"
 
 #include "OBJ.hpp"
 #include "objparser.hpp"
 
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <fstream>
+#include <iterator>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
+#include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
 
 #ifdef _WIN32
@@ -20,6 +30,115 @@
 #define _L(s) Slic3r::I18N::translate(s)
 
 namespace Slic3r {
+
+namespace {
+
+static std::string resolve_obj_asset_path(const char *obj_path, const std::string &asset_path)
+{
+    boost::filesystem::path texture_path(asset_path);
+    if (texture_path.is_absolute())
+        return texture_path.string();
+
+    boost::filesystem::path full_obj_path(obj_path);
+    return (full_obj_path.parent_path() / texture_path).string();
+}
+
+static std::string lower_extension(boost::filesystem::path path)
+{
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return ext;
+}
+
+static bool extension_matches(const boost::filesystem::path &path, const std::vector<std::string> &extensions)
+{
+    const std::string ext = lower_extension(path);
+    return std::find(extensions.begin(), extensions.end(), ext) != extensions.end();
+}
+
+static boost::filesystem::path fallback_obj_asset_path(const char *obj_path, const boost::filesystem::path &requested_path, const std::vector<std::string> &extensions)
+{
+    const boost::filesystem::path full_obj_path(obj_path);
+    const boost::filesystem::path dir = full_obj_path.parent_path();
+    if (dir.empty() || !boost::filesystem::exists(dir))
+        return {};
+
+    if (!requested_path.extension().empty()) {
+        boost::filesystem::path same_stem = dir / full_obj_path.stem();
+        same_stem.replace_extension(requested_path.extension());
+        if (boost::filesystem::exists(same_stem))
+            return same_stem;
+    }
+
+    boost::filesystem::path only_match;
+    size_t match_count = 0;
+    for (const boost::filesystem::directory_entry &entry : boost::filesystem::directory_iterator(dir)) {
+        if (!boost::filesystem::is_regular_file(entry.status()) || !extension_matches(entry.path(), extensions))
+            continue;
+        only_match = entry.path();
+        ++match_count;
+        if (match_count > 1)
+            return {};
+    }
+
+    return match_count == 1 ? only_match : boost::filesystem::path{};
+}
+
+static std::string resolve_existing_obj_asset_path(const char *obj_path, const std::string &asset_path, const std::vector<std::string> &fallback_extensions)
+{
+    const boost::filesystem::path resolved_path(resolve_obj_asset_path(obj_path, asset_path));
+    if (boost::filesystem::exists(resolved_path))
+        return resolved_path.string();
+
+    const boost::filesystem::path fallback_path = fallback_obj_asset_path(obj_path, resolved_path, fallback_extensions);
+    return fallback_path.empty() ? resolved_path.string() : fallback_path.string();
+}
+
+static bool load_png_texture(const std::string &texture_path, png::ImageColorscale &image)
+{
+    if (!boost::filesystem::exists(texture_path))
+        return false;
+
+    std::ifstream texture_file(texture_path, std::ios::binary);
+    if (!texture_file)
+        return false;
+
+    std::vector<char> buffer{std::istreambuf_iterator<char>(texture_file), std::istreambuf_iterator<char>()};
+    if (buffer.empty())
+        return false;
+
+    png::ReadBuf read_buffer{buffer.data(), buffer.size()};
+    return png::decode_colored_png(read_buffer, image);
+}
+
+static float wrap_uv(float value)
+{
+    value -= std::floor(value);
+    return value < 0.f ? value + 1.f : value;
+}
+
+static RGBA sample_texture(const png::ImageColorscale &image, float u, float v)
+{
+    if (image.cols == 0 || image.rows == 0 || image.buf.empty())
+        return RGBA{1.f, 1.f, 1.f, 1.f};
+
+    const size_t x = std::min<size_t>(image.cols - 1, static_cast<size_t>(std::lround(wrap_uv(u) * float(image.cols - 1))));
+    const size_t y = std::min<size_t>(image.rows - 1, static_cast<size_t>(std::lround(wrap_uv(v) * float(image.rows - 1))));
+    const size_t bytes_per_pixel = static_cast<size_t>(image.bytes_per_pixel);
+    const size_t offset = (y * image.cols + x) * bytes_per_pixel;
+
+    if (offset + 2 >= image.buf.size())
+        return RGBA{1.f, 1.f, 1.f, 1.f};
+
+    return RGBA{
+        float(image.buf[offset]) / 255.f,
+        float(image.buf[offset + 1]) / 255.f,
+        float(image.buf[offset + 2]) / 255.f,
+        bytes_per_pixel >= 4 && offset + 3 < image.buf.size() ? float(image.buf[offset + 3]) / 255.f : 1.f
+    };
+}
+
+} // namespace
 
 bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::string &message)
 {
@@ -53,16 +172,25 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
                 boost::filesystem::path temp_mtl_path(mtl_file);
                 mtl_path = temp_mtl_path;
             }
-            auto    _mtl_path = mtl_name_is_path ? mtl_abs_path.string().c_str() : mtl_path.string().c_str();
-            if (boost::filesystem::exists(mtl_name_is_path ? mtl_abs_path : mtl_path)) {
-                if (!ObjParser::mtlparse(_mtl_path, mtl_data)) {
-                    BOOST_LOG_TRIVIAL(error) << "load_obj:load_mtl: failed to parse " << _mtl_path;
+            boost::filesystem::path resolved_mtl_path = mtl_name_is_path ? mtl_abs_path : mtl_path;
+            if (!boost::filesystem::exists(resolved_mtl_path)) {
+                const boost::filesystem::path fallback_mtl_path = fallback_obj_asset_path(path, resolved_mtl_path, {".mtl"});
+                if (!fallback_mtl_path.empty()) {
+                    BOOST_LOG_TRIVIAL(info) << "load_obj: using fallback mtl_path:" << fallback_mtl_path.string();
+                    resolved_mtl_path = fallback_mtl_path;
+                }
+            }
+
+            if (boost::filesystem::exists(resolved_mtl_path)) {
+                const std::string resolved_mtl_path_string = resolved_mtl_path.string();
+                if (!ObjParser::mtlparse(resolved_mtl_path_string.c_str(), mtl_data)) {
+                    BOOST_LOG_TRIVIAL(error) << "load_obj:load_mtl: failed to parse " << resolved_mtl_path_string;
                     message = _L("load mtl in obj: failed to parse");
                     return false;
                 }
             }
             else {
-                BOOST_LOG_TRIVIAL(error) << "load_obj: failed to load mtl_path:" << _mtl_path;
+                BOOST_LOG_TRIVIAL(error) << "load_obj: failed to load mtl_path:" << resolved_mtl_path.string();
             }
         }
     }
@@ -97,7 +225,6 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
     its.vertices.reserve(num_vertices);
     its.indices.reserve(num_faces + num_quads);
     if (exist_mtl) {
-        obj_info.is_single_mtl = data.usemtls.size() == 1 && mtl_data.new_mtl_unmap.size() == 1;
         obj_info.face_colors.reserve(num_faces + num_quads);
     }
     bool has_color = data.has_vertex_color;
@@ -112,6 +239,8 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
     }
     int indices[ONE_FACE_SIZE];
     int uvs[ONE_FACE_SIZE];
+    std::unordered_map<std::string, png::ImageColorscale> texture_cache;
+    std::unordered_set<std::string> failed_texture_cache;
     for (size_t i = 0; i < data.vertices.size();)
         if (data.vertices[i].coordIdx == -1)
             ++ i;
@@ -137,65 +266,112 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
                 its.indices.emplace_back(indices[0], indices[1], indices[2]);
                 int  face_index =its.indices.size() - 1;
                 RGBA face_color;
-                auto set_face_color = [&uvs, &data, &mtl_data, &obj_info, &face_color](int face_index, const std::string mtl_name) {
+                auto sample_face_texture = [&data, &texture_cache, &failed_texture_cache, path](const std::string &texture_name, const std::array<int, 3> &face_uvs, RGBA &out_color) {
+                    if (texture_name.empty() || data.textureCoordinates.empty())
+                        return false;
+
+                    for (int uv_index : face_uvs)
+                        if (uv_index < 0 || size_t(uv_index * 2 + 1) >= data.textureCoordinates.size())
+                            return false;
+
+                    const std::string texture_path = resolve_existing_obj_asset_path(path, texture_name, {".png", ".jpg", ".jpeg"});
+                    if (failed_texture_cache.find(texture_path) != failed_texture_cache.end())
+                        return false;
+
+                    auto texture_it = texture_cache.find(texture_path);
+                    if (texture_it == texture_cache.end()) {
+                        png::ImageColorscale image;
+                        if (!load_png_texture(texture_path, image)) {
+                            failed_texture_cache.insert(texture_path);
+                            return false;
+                        }
+                        texture_it = texture_cache.emplace(texture_path, std::move(image)).first;
+                    }
+
+                    const float u0 = data.textureCoordinates[face_uvs[0] * 2];
+                    const float v0 = data.textureCoordinates[face_uvs[0] * 2 + 1];
+                    const float u1 = data.textureCoordinates[face_uvs[1] * 2];
+                    const float v1 = data.textureCoordinates[face_uvs[1] * 2 + 1];
+                    const float u2 = data.textureCoordinates[face_uvs[2] * 2];
+                    const float v2 = data.textureCoordinates[face_uvs[2] * 2 + 1];
+
+                    out_color = sample_texture(texture_it->second, (u0 + u1 + u2) / 3.f, (v0 + v1 + v2) / 3.f);
+                    return true;
+                };
+                auto set_face_color = [&data, &mtl_data, &obj_info, &face_color, &sample_face_texture](int face_index, const std::string mtl_name, const std::array<int, 3> face_uvs) {
                     if (mtl_data.new_mtl_unmap.find(mtl_name) != mtl_data.new_mtl_unmap.end()) {
+                        const auto &material = mtl_data.new_mtl_unmap[mtl_name];
                         bool is_merge_ka_kd = true;
                         for (size_t n = 0; n < 3; n++) {
-                            if (float(mtl_data.new_mtl_unmap[mtl_name]->Ka[n] + mtl_data.new_mtl_unmap[mtl_name]->Kd[n]) > 1.0) {
+                            if (float(material->Ka[n] + material->Kd[n]) > 1.0) {
                                 is_merge_ka_kd=false;
                                 break;
                             }
                         }
                         for (size_t n = 0; n < 3; n++) {
                             if (is_merge_ka_kd) {
-                                face_color[n] = std::clamp(float(mtl_data.new_mtl_unmap[mtl_name]->Ka[n] + mtl_data.new_mtl_unmap[mtl_name]->Kd[n]), 0.f, 1.f);
+                                face_color[n] = std::clamp(float(material->Ka[n] + material->Kd[n]), 0.f, 1.f);
                             }
                             else {
-                                face_color[n] = std::clamp(float(mtl_data.new_mtl_unmap[mtl_name]->Kd[n]), 0.f, 1.f);
+                                face_color[n] = std::clamp(float(material->Kd[n]), 0.f, 1.f);
                             }
                         }
-                        face_color[3] = mtl_data.new_mtl_unmap[mtl_name]->Tr; // alpha
-                        if (mtl_data.new_mtl_unmap[mtl_name]->map_Kd.size() > 0) {
-                            auto png_name       = mtl_data.new_mtl_unmap[mtl_name]->map_Kd;
+                        face_color[3] = material->Tr; // alpha
+                        if (material->map_Kd.size() > 0) {
+                            auto png_name       = material->map_Kd;
                             obj_info.has_uv_png = true;
                             if (obj_info.pngs.find(png_name) == obj_info.pngs.end()) { obj_info.pngs[png_name] = false; }
                             obj_info.uv_map_pngs[face_index] = png_name;
+                            sample_face_texture(png_name, face_uvs, face_color);
                         }
                         if (data.textureCoordinates.size() > 0) {
-                            Vec2f                uv0(data.textureCoordinates[uvs[0] * 2], data.textureCoordinates[uvs[0] * 2 + 1]);
-                            Vec2f                uv1(data.textureCoordinates[uvs[1] * 2], data.textureCoordinates[uvs[1] * 2 + 1]);
-                            Vec2f                uv2(data.textureCoordinates[uvs[2] * 2], data.textureCoordinates[uvs[2] * 2 + 1]);
-                            std::array<Vec2f, 3> uv_array{uv0, uv1, uv2};
-                            obj_info.uvs.emplace_back(uv_array);
+                            bool valid_uvs = true;
+                            for (int uv_index : face_uvs)
+                                if (uv_index < 0 || size_t(uv_index * 2 + 1) >= data.textureCoordinates.size())
+                                    valid_uvs = false;
+                            if (valid_uvs) {
+                                Vec2f                uv0(data.textureCoordinates[face_uvs[0] * 2], data.textureCoordinates[face_uvs[0] * 2 + 1]);
+                                Vec2f                uv1(data.textureCoordinates[face_uvs[1] * 2], data.textureCoordinates[face_uvs[1] * 2 + 1]);
+                                Vec2f                uv2(data.textureCoordinates[face_uvs[2] * 2], data.textureCoordinates[face_uvs[2] * 2 + 1]);
+                                std::array<Vec2f, 3> uv_array{uv0, uv1, uv2};
+                                obj_info.uvs.emplace_back(uv_array);
+                            }
                         }
                         obj_info.face_colors.emplace_back(face_color);
                     }
                 };
-                auto set_face_color_by_mtl = [&data, &set_face_color](int face_index) {
+                auto set_face_color_by_mtl = [&data, &set_face_color](int face_index, const std::array<int, 3> face_uvs) {
                     if (data.usemtls.size() == 1) {
-                        set_face_color(face_index, data.usemtls[0].name);
+                        set_face_color(face_index, data.usemtls[0].name, face_uvs);
                     } else {
                         for (size_t k = 0; k < data.usemtls.size(); k++) {
                             auto mtl = data.usemtls[k];
                             if (face_index >= mtl.face_start && face_index <= mtl.face_end) {
-                                set_face_color(face_index, data.usemtls[k].name);
+                                set_face_color(face_index, data.usemtls[k].name, face_uvs);
                                 break;
                             }
                         }
                     }
                 };
                 if (exist_mtl) {
-                    set_face_color_by_mtl(face_index);
+                    set_face_color_by_mtl(face_index, {uvs[0], uvs[1], uvs[2]});
                 }
                 if (cnt == 4) {
                     its.indices.emplace_back(indices[0], indices[2], indices[3]);
                     int face_index = its.indices.size() - 1;
                     if (exist_mtl) {
-                        set_face_color_by_mtl(face_index);
+                        set_face_color_by_mtl(face_index, {uvs[0], uvs[2], uvs[3]});
                     }
                 }
             }
         }
+
+    if (!obj_info.face_colors.empty()) {
+        const RGBA first_color = obj_info.face_colors.front();
+        obj_info.is_single_mtl = std::all_of(obj_info.face_colors.begin() + 1, obj_info.face_colors.end(), [&first_color](const RGBA &color) {
+            return color_is_equal(first_color, color);
+        });
+    }
 
     *meshptr = TriangleMesh(std::move(its));
     if (meshptr->empty()) {

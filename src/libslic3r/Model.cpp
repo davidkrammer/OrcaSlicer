@@ -28,6 +28,7 @@
 #include "SVG.hpp"
 #include <Eigen/Dense>
 #include <functional>
+#include <limits>
 #include "GCodeWriter.hpp"
 
 // BBS: for segment
@@ -279,9 +280,12 @@ Model Model::read_from_file(const std::string&                                  
                         result = obj_import_vertex_color_deal(vertex_filament_ids, first_extruder_id, & model);
                     }
                 }
-            } else if (obj_info.face_colors.size() > 0 && obj_info.has_uv_png == false) { // mtl file
+            } else if (obj_info.face_colors.size() > 0) { // mtl file or texture-sampled mtl
                 std::vector<unsigned char> face_filament_ids;
-                if (objFn) { // 1.result is ok and pop up a dialog
+                if (obj_info.has_uv_png && obj_import_virtual_face_color_deal(obj_info.face_colors, &model)) {
+                    // Textured OBJs keep sampled face colors as virtual target colors. They are converted
+                    // to CMY/CMYK/CMYW process channels at slice time, not to physical filament slots here.
+                } else if (objFn) { // 1.result is ok and pop up a dialog
                     objFn(obj_info.face_colors, obj_info.is_single_mtl, face_filament_ids, first_extruder_id);
                     if (face_filament_ids.size() > 0) {
                         result = obj_import_face_color_deal(face_filament_ids, first_extruder_id, &model);
@@ -1828,6 +1832,8 @@ void ModelObject::convert_units(ModelObjectPtrs& new_objects, ConversionType con
             vol->supported_facets.assign(volume->supported_facets);
             vol->seam_facets.assign(volume->seam_facets);
             vol->mmu_segmentation_facets.assign(volume->mmu_segmentation_facets);
+            vol->virtual_face_colors = volume->virtual_face_colors;
+            vol->invalidate_color_synthesis_facets();
             vol->fuzzy_skin_facets.assign(volume->fuzzy_skin_facets);
 
             // Perform conversion only if the target "imperial" state is different from the current one.
@@ -1940,6 +1946,7 @@ void ModelVolume::reset_extra_facets()
     this->supported_facets.reset();
     this->seam_facets.reset();
     this->mmu_segmentation_facets.reset();
+    this->invalidate_color_synthesis_facets();
     this->fuzzy_skin_facets.reset();
 }
 
@@ -2746,6 +2753,7 @@ void ModelVolume::assign_new_unique_ids_recursive()
     supported_facets.set_new_unique_id();
     seam_facets.set_new_unique_id();
     mmu_segmentation_facets.set_new_unique_id();
+    m_color_synthesis_facets.set_new_unique_id();
     fuzzy_skin_facets.set_new_unique_id();
 }
 
@@ -2962,6 +2970,150 @@ static void get_real_filament_id(const unsigned char &id, std::string &result) {
         result = "";//error
     }
 };
+
+static std::array<float, 4> process_weights_for_virtual_color(ColorSynthesisMode mode, const RGBA &color)
+{
+    std::array<float, 4> weights{0.f, 0.f, 0.f, 0.f};
+
+    const float r = std::clamp(color[0], 0.f, 1.f);
+    const float g = std::clamp(color[1], 0.f, 1.f);
+    const float b = std::clamp(color[2], 0.f, 1.f);
+    const float c = 1.f - r;
+    const float m = 1.f - g;
+    const float y = 1.f - b;
+
+    switch (mode) {
+    case ColorSynthesisMode::CMY:
+        weights = {c, m, y, 0.f};
+        break;
+    case ColorSynthesisMode::CMYK: {
+        const float k_max = std::min({c, m, y});
+        const float chroma = std::max({c, m, y}) - k_max;
+        const float k_thresh = std::max(0.f, (k_max - 0.35f) / 0.65f);
+        const float k_scale = (1.f - chroma * 0.7f) * k_thresh;
+        const float k = k_max * k_scale;
+        weights = {c - k, m - k, y - k, k};
+        break;
+    }
+    case ColorSynthesisMode::CMYW: {
+        const float shared_gray = std::min({c, m, y});
+        const float white = 1.f - std::max({c, m, y});
+        const float gray_third = shared_gray / 3.f;
+        weights = {c - shared_gray + gray_third, m - shared_gray + gray_third, y - shared_gray + gray_third, white};
+        break;
+    }
+    case ColorSynthesisMode::Standard:
+    default:
+        break;
+    }
+
+    for (float &weight : weights)
+        weight = std::max(0.f, weight);
+    return weights;
+}
+
+static float stable_unit_noise(size_t face_idx, const RGBA &color)
+{
+    uint32_t h = 2166136261u;
+    auto mix = [&h](uint32_t v) {
+        h ^= v;
+        h *= 16777619u;
+    };
+
+    mix(uint32_t(face_idx));
+    mix(uint32_t(std::clamp(color[0], 0.f, 1.f) * 255.f + 0.5f));
+    mix(uint32_t(std::clamp(color[1], 0.f, 1.f) * 255.f + 0.5f) << 8);
+    mix(uint32_t(std::clamp(color[2], 0.f, 1.f) * 255.f + 0.5f) << 16);
+    h ^= h >> 16;
+    h *= 2246822519u;
+    h ^= h >> 13;
+    h *= 3266489917u;
+    h ^= h >> 16;
+    return float(h) / float(std::numeric_limits<uint32_t>::max());
+}
+
+static int choose_process_channel_for_face(const std::array<float, 4> &weights, size_t channels, size_t face_idx, const RGBA &color)
+{
+    float total = 0.f;
+    for (size_t channel = 0; channel < channels; ++channel)
+        total += weights[channel];
+    if (total <= 0.001f)
+        return -1;
+
+    const float needle = stable_unit_noise(face_idx, color) * total;
+    float cumulative = 0.f;
+    for (size_t channel = 0; channel < channels; ++channel) {
+        cumulative += weights[channel];
+        if (needle <= cumulative)
+            return int(channel);
+    }
+    return int(channels - 1);
+}
+
+void ModelVolume::invalidate_color_synthesis_facets() const
+{
+    m_color_synthesis_facets = FacetsAnnotation();
+    m_color_synthesis_facets.touch();
+    m_color_synthesis_facets_mode = -1;
+    m_color_synthesis_facets_channels = 0;
+    m_color_synthesis_facets_color_count = 0;
+}
+
+const FacetsAnnotation& ModelVolume::color_synthesis_facets(ColorSynthesisMode mode, size_t channels) const
+{
+    channels = std::min<size_t>(channels, 4);
+    if (!this->has_virtual_face_colors() || mode == ColorSynthesisMode::Standard || channels == 0) {
+        if (m_color_synthesis_facets_color_count != 0)
+            this->invalidate_color_synthesis_facets();
+        return m_color_synthesis_facets;
+    }
+
+    const int mode_key = int(mode);
+    if (m_color_synthesis_facets_color_count == virtual_face_colors.size() &&
+        m_color_synthesis_facets_mode == mode_key &&
+        m_color_synthesis_facets_channels == channels) {
+        return m_color_synthesis_facets;
+    }
+
+    m_color_synthesis_facets = FacetsAnnotation();
+    m_color_synthesis_facets.reserve(int(virtual_face_colors.size()));
+    for (size_t face_idx = 0; face_idx < virtual_face_colors.size(); ++face_idx) {
+        const RGBA &color = virtual_face_colors[face_idx];
+        const auto weights = process_weights_for_virtual_color(mode, color);
+        const int channel = choose_process_channel_for_face(weights, channels, face_idx, color);
+        if (channel < 0)
+            continue;
+
+        std::string encoded_state;
+        get_real_filament_id(static_cast<unsigned char>(channel + 1), encoded_state);
+        if (!encoded_state.empty())
+            m_color_synthesis_facets.set_triangle_from_string(int(face_idx), encoded_state);
+    }
+    m_color_synthesis_facets.shrink_to_fit();
+    m_color_synthesis_facets.touch();
+    m_color_synthesis_facets_mode = mode_key;
+    m_color_synthesis_facets_channels = channels;
+    m_color_synthesis_facets_color_count = virtual_face_colors.size();
+    return m_color_synthesis_facets;
+}
+
+bool Model::obj_import_virtual_face_color_deal(const std::vector<RGBA> &face_colors, Model *model)
+{
+    if (face_colors.empty() || model == nullptr || model->objects.size() != 1)
+        return false;
+
+    ModelObject *obj = model->objects[0];
+    if (obj == nullptr || obj->volumes.size() != 1)
+        return false;
+
+    ModelVolume *volume = obj->volumes[0];
+    if (volume == nullptr || volume->mesh().its.indices.size() != face_colors.size())
+        return false;
+
+    volume->virtual_face_colors = face_colors;
+    volume->invalidate_color_synthesis_facets();
+    return true;
+}
 
 bool Model::obj_import_vertex_color_deal(const std::vector<unsigned char> &vertex_filament_ids, const unsigned char &first_extruder_id, Model *model)
 {

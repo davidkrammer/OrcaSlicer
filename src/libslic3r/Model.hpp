@@ -37,6 +37,8 @@
 #include <functional>
 #include <optional>
 
+#include <cereal/types/array.hpp>
+
 namespace cereal {
 	class BinaryInputArchive;
 	class BinaryOutputArchive;
@@ -873,6 +875,10 @@ public:
     // List of mesh facets painted for MMU segmentation.
     FacetsAnnotation    mmu_segmentation_facets;
 
+    // Per-triangle target colors imported from textured OBJ files. These are not physical filaments;
+    // CMY/CMYK/CMYW slicing derives process-channel facets from them on demand.
+    std::vector<RGBA>   virtual_face_colors;
+
     // List of mesh facets painted for fuzzy skin.
     FacetsAnnotation    fuzzy_skin_facets;
 
@@ -904,6 +910,9 @@ public:
     bool                is_text()               const { return text_configuration.has_value(); }
     bool                is_svg() const { return emboss_shape.has_value()  && !text_configuration.has_value(); }
     bool                is_the_only_one_part() const; // behave like an object
+    bool                has_virtual_face_colors() const { return virtual_face_colors.size() == this->mesh().its.indices.size() && !virtual_face_colors.empty(); }
+    void                invalidate_color_synthesis_facets() const;
+    const FacetsAnnotation& color_synthesis_facets(ColorSynthesisMode mode, size_t channels) const;
     t_model_material_id material_id() const { return m_material_id; }
     void                set_material_id(t_model_material_id material_id);
     void                reset_extra_facets();
@@ -1040,6 +1049,10 @@ private:
     mutable Transform3d                 m_cached_trans_matrix; //BBS, used for convex_hell_2d acceleration
     mutable Polygon                     m_cached_2d_polygon;   //BBS, used for convex_hell_2d acceleration
     Geometry::Transformation        	m_transformation;
+    mutable FacetsAnnotation            m_color_synthesis_facets;
+    mutable int                         m_color_synthesis_facets_mode { -1 };
+    mutable size_t                      m_color_synthesis_facets_channels { 0 };
+    mutable size_t                      m_color_synthesis_facets_color_count { 0 };
 
     //BBS: add convex_hell_2d related logic
     void  calculate_convex_hull_2d(const Geometry::Transformation &transformation) const;
@@ -1101,7 +1114,7 @@ private:
         name(other.name), source(other.source), m_mesh(other.m_mesh), m_convex_hull(other.m_convex_hull),
         config(other.config), m_type(other.m_type), object(object), m_transformation(other.m_transformation),
         supported_facets(other.supported_facets), seam_facets(other.seam_facets), mmu_segmentation_facets(other.mmu_segmentation_facets),
-        fuzzy_skin_facets(other.fuzzy_skin_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
+        virtual_face_colors(other.virtual_face_colors), fuzzy_skin_facets(other.fuzzy_skin_facets), cut_info(other.cut_info), text_configuration(other.text_configuration), emboss_shape(other.emboss_shape)
     {
 		assert(this->id().valid()); 
         assert(this->config.id().valid()); 
@@ -1154,6 +1167,10 @@ private:
         assert(this->seam_facets.empty());
         assert(this->mmu_segmentation_facets.empty());
         assert(this->fuzzy_skin_facets.empty());
+        if (other.virtual_face_colors.size() == m_mesh->its.indices.size()) {
+            this->virtual_face_colors = other.virtual_face_colors;
+            this->invalidate_color_synthesis_facets();
+        }
     }
 
     ModelVolume& operator=(ModelVolume &rhs) = delete;
@@ -1161,7 +1178,7 @@ private:
 	friend class cereal::access;
 	friend class UndoRedo::StackImpl;
 	// Used for deserialization, therefore no IDs are allocated.
-	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), fuzzy_skin_facets(-1), object(nullptr) {
+	ModelVolume() : ObjectBase(-1), config(-1), supported_facets(-1), seam_facets(-1), mmu_segmentation_facets(-1), fuzzy_skin_facets(-1), m_color_synthesis_facets(-1), object(nullptr) {
 		assert(this->id().invalid());
         assert(this->config.id().invalid());
         assert(this->supported_facets.id().invalid());
@@ -1185,6 +1202,8 @@ private:
         t = mmu_segmentation_facets.timestamp();
         cereal::load_by_value(ar, mmu_segmentation_facets);
         mesh_changed |= t != mmu_segmentation_facets.timestamp();
+        cereal::load(ar, virtual_face_colors);
+        this->invalidate_color_synthesis_facets();
         cereal::load_by_value(ar, fuzzy_skin_facets);
         mesh_changed |= t != fuzzy_skin_facets.timestamp();
         cereal::load_by_value(ar, config);
@@ -1207,6 +1226,7 @@ private:
         cereal::save_by_value(ar, supported_facets);
         cereal::save_by_value(ar, seam_facets);
         cereal::save_by_value(ar, mmu_segmentation_facets);
+        cereal::save(ar, virtual_face_colors);
         cereal::save_by_value(ar, fuzzy_skin_facets);
         cereal::save_by_value(ar, config);
         cereal::save(ar, text_configuration);
@@ -1593,6 +1613,7 @@ public:
     // BBS
     static bool    obj_import_vertex_color_deal(const std::vector<unsigned char> &vertex_filament_ids, const unsigned char &first_extruder_id, Model *model);
     static bool    obj_import_face_color_deal(const std::vector<unsigned char> &face_filament_ids, const unsigned char &first_extruder_id, Model *model);
+    static bool    obj_import_virtual_face_color_deal(const std::vector<RGBA> &face_colors, Model *model);
     static double findMaxSpeed(const ModelObject* object);
     static double getThermalLength(const ModelVolume* modelVolumePtr);
     static double getThermalLength(const std::vector<ModelVolume*> modelVolumePtrs);

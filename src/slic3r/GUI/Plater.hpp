@@ -163,6 +163,7 @@ public:
     void sync_ams_list();
     // Orca
     void show_SEMM_buttons(bool bshow);
+    void update_color_synthesis_visibility();
     void update_dynamic_filament_list();
 
     void update_nozzle_settings(bool switch_machine = false);

@@ -137,6 +137,25 @@ enum class SlicingMode
     CloseHoles,
 };
 
+enum class ColorSynthesisMode
+{
+    Standard,
+    CMY,
+    CMYK,
+    CMYW,
+};
+
+inline int color_synthesis_channel_count(ColorSynthesisMode mode)
+{
+    switch (mode) {
+    case ColorSynthesisMode::CMY:  return 3;
+    case ColorSynthesisMode::CMYK: return 4;
+    case ColorSynthesisMode::CMYW: return 4;
+    case ColorSynthesisMode::Standard:
+    default:                       return 0;
+    }
+}
+
 enum SupportMaterialPattern {
     smpDefault,
     smpRectilinear, smpRectilinearGrid, smpHoneycomb,
@@ -467,6 +486,7 @@ CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(NoiseType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(InfillPattern)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(IroningType)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SlicingMode)
+CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(ColorSynthesisMode)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SupportMaterialPattern)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SupportMaterialStyle)
 CONFIG_OPTION_ENUM_DECLARE_STATIC_MAPS(SupportMaterialInterfacePattern)
@@ -1337,6 +1357,7 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionBools,              dont_slow_down_outer_wall))
     ((ConfigOptionFloats,             fan_cooling_layer_time))
     ((ConfigOptionStrings,            filament_colour))
+    ((ConfigOptionEnum<ColorSynthesisMode>, color_synthesis_mode))
     ((ConfigOptionBools,              activate_air_filtration))
     ((ConfigOptionInts,               during_print_exhaust_fan_speed))
     ((ConfigOptionInts,               complete_print_exhaust_fan_speed))

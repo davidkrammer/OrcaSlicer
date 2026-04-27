@@ -13,7 +13,10 @@
 
 #include <GL/glew.h>
 
+#include <algorithm>
+#include <cmath>
 #include <thread>
+#include <unordered_map>
 
 namespace Slic3r::GUI {
 
@@ -54,6 +57,108 @@ static ModelVolume* get_model_volume(const Selection& selection, Model& model)
     if (cid.volume_id < 0 || obj->volumes.size() <= static_cast<size_t>(cid.volume_id))
         return nullptr;
     return obj->volumes[cid.volume_id];
+}
+
+struct FaceColorGridKey
+{
+    int x;
+    int y;
+    int z;
+
+    bool operator==(const FaceColorGridKey &other) const
+    {
+        return x == other.x && y == other.y && z == other.z;
+    }
+};
+
+struct FaceColorGridKeyHash
+{
+    size_t operator()(const FaceColorGridKey &key) const noexcept
+    {
+        size_t h = 1469598103934665603ull;
+        auto mix = [&h](int value) {
+            h ^= size_t(value) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+        };
+        mix(key.x);
+        mix(key.y);
+        mix(key.z);
+        return h;
+    }
+};
+
+static Vec3f face_centroid(const indexed_triangle_set &its, const stl_triangle_vertex_indices &face)
+{
+    return (its.vertices[face[0]] + its.vertices[face[1]] + its.vertices[face[2]]) / 3.f;
+}
+
+static std::vector<RGBA> transfer_virtual_face_colors_after_simplify(const indexed_triangle_set &source,
+                                                                     const std::vector<RGBA>   &source_colors,
+                                                                     const indexed_triangle_set &simplified)
+{
+    if (source_colors.size() != source.indices.size() || simplified.indices.empty())
+        return {};
+
+    std::vector<Vec3f> source_centroids;
+    source_centroids.reserve(source.indices.size());
+
+    Vec3f min_corner = Vec3f::Constant(std::numeric_limits<float>::max());
+    Vec3f max_corner = Vec3f::Constant(std::numeric_limits<float>::lowest());
+    for (const stl_triangle_vertex_indices &face : source.indices) {
+        const Vec3f centroid = face_centroid(source, face);
+        source_centroids.push_back(centroid);
+        min_corner = min_corner.cwiseMin(centroid);
+        max_corner = max_corner.cwiseMax(centroid);
+    }
+
+    const float diagonal = (max_corner - min_corner).norm();
+    const float cell_size = diagonal > 0.f ?
+        diagonal / std::max(16.f, std::cbrt(float(source_centroids.size()))) :
+        1.f;
+
+    auto key_for = [&min_corner, cell_size](const Vec3f &point) {
+        return FaceColorGridKey{
+            int(std::floor((point.x() - min_corner.x()) / cell_size)),
+            int(std::floor((point.y() - min_corner.y()) / cell_size)),
+            int(std::floor((point.z() - min_corner.z()) / cell_size))
+        };
+    };
+
+    std::unordered_map<FaceColorGridKey, std::vector<size_t>, FaceColorGridKeyHash> grid;
+    grid.reserve(source_centroids.size());
+    for (size_t idx = 0; idx < source_centroids.size(); ++idx)
+        grid[key_for(source_centroids[idx])].push_back(idx);
+
+    std::vector<RGBA> simplified_colors;
+    simplified_colors.reserve(simplified.indices.size());
+    for (const stl_triangle_vertex_indices &face : simplified.indices) {
+        const Vec3f centroid = face_centroid(simplified, face);
+        const FaceColorGridKey center_key = key_for(centroid);
+
+        size_t best_idx = size_t(-1);
+        float best_dist_sq = std::numeric_limits<float>::max();
+        for (int radius = 0; radius <= 8 && best_idx == size_t(-1); ++radius) {
+            for (int dz = -radius; dz <= radius; ++dz)
+                for (int dy = -radius; dy <= radius; ++dy)
+                    for (int dx = -radius; dx <= radius; ++dx) {
+                        if (std::max({std::abs(dx), std::abs(dy), std::abs(dz)}) != radius)
+                            continue;
+                        auto it = grid.find({center_key.x + dx, center_key.y + dy, center_key.z + dz});
+                        if (it == grid.end())
+                            continue;
+                        for (size_t candidate_idx : it->second) {
+                            const float dist_sq = (source_centroids[candidate_idx] - centroid).squaredNorm();
+                            if (dist_sq < best_dist_sq) {
+                                best_dist_sq = dist_sq;
+                                best_idx = candidate_idx;
+                            }
+                        }
+                    }
+        }
+
+        simplified_colors.push_back(best_idx == size_t(-1) ? source_colors.front() : source_colors[best_idx]);
+    }
+
+    return simplified_colors;
 }
 
 GLGizmoSimplify::GLGizmoSimplify(GLCanvas3D &       parent,
@@ -540,8 +645,18 @@ void GLGizmoSimplify::apply_simplify() {
     ModelVolume* mv = get_model_volume(selection, wxGetApp().model());
     assert(mv == m_volume);
 
+    std::vector<RGBA> simplified_virtual_face_colors =
+        transfer_virtual_face_colors_after_simplify(mv->mesh().its, mv->virtual_face_colors, *m_state.result);
+
     mv->set_mesh(std::move(*m_state.result));
     m_state.result.reset();
+    mv->supported_facets.reset();
+    mv->seam_facets.reset();
+    mv->mmu_segmentation_facets.reset();
+    mv->fuzzy_skin_facets.reset();
+    mv->exterior_facets.reset();
+    mv->virtual_face_colors = std::move(simplified_virtual_face_colors);
+    mv->invalidate_color_synthesis_facets();
     mv->calculate_convex_hull();
     mv->invalidate_convex_hull_2d();
     mv->set_new_unique_id();

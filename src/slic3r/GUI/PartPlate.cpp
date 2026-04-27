@@ -5,6 +5,7 @@
 #include <string>
 #include <regex>
 #include <future>
+#include <limits>
 #include <GL/glew.h>
 #include <boost/algorithm/string.hpp>
 #include <boost/optional.hpp>
@@ -2067,7 +2068,7 @@ bool PartPlate::check_outside(int obj_id, int instance_id, BoundingBoxf3* boundi
 		// Orca: For sinking object, we use a more expensive algorithm so part below build plate won't be considered
 		if (plate_box.intersects(instance_box)) {
 			// TODO: FIXME: this does not take exclusion area into account
-			const BuildVolume build_volume(get_shape(), m_plater->build_volume().printable_height());
+			const BuildVolume build_volume(get_shape(), double(m_height));
 			const auto state = instance->calc_print_volume_state(build_volume);
 			outside = state == ModelInstancePVS_Partly_Outside;
 		}
@@ -5291,7 +5292,11 @@ int PartPlateList::rebuild_plates_after_arrangement(bool recycle_plates, bool ex
 	BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(":before rebuild, plates count %1%, recycle_plates %2%") % m_plate_list.size() % recycle_plates;
 
 	// sort by arrange_order
-	std::sort(m_model->objects.begin(), m_model->objects.end(), [](auto a, auto b) {return a->instances[0]->arrange_order < b->instances[0]->arrange_order; });
+	std::sort(m_model->objects.begin(), m_model->objects.end(), [](auto a, auto b) {
+		const int a_order = (a != nullptr && !a->instances.empty()) ? a->instances[0]->arrange_order : std::numeric_limits<int>::max();
+		const int b_order = (b != nullptr && !b->instances.empty()) ? b->instances[0]->arrange_order : std::numeric_limits<int>::max();
+		return a_order < b_order;
+	});
 	//for (auto object : m_model->objects)
 	//	std::sort(object->instances.begin(), object->instances.end(), [](auto a, auto b) {return a->arrange_order < b->arrange_order; });
 

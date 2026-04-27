@@ -13,6 +13,8 @@
 
 #include "3mf.hpp"
 
+#include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 
@@ -113,11 +115,67 @@ static constexpr const char* CUSTOM_SUPPORTS_ATTR = "slic3rpe:custom_supports";
 static constexpr const char* CUSTOM_SEAM_ATTR = "slic3rpe:custom_seam";
 static constexpr const char* MMU_SEGMENTATION_ATTR = "slic3rpe:mmu_segmentation";
 static constexpr const char* FUZZY_SKIN_ATTR = "slic3rpe:fuzzy_skin";
+static constexpr const char* VIRTUAL_FACE_COLOR_ATTR = "slic3rpe:virtual_face_color";
 
 static constexpr const char* KEY_ATTR = "key";
 static constexpr const char* VALUE_ATTR = "value";
 static constexpr const char* FIRST_TRIANGLE_ID_ATTR = "firstid";
 static constexpr const char* LAST_TRIANGLE_ID_ATTR = "lastid";
+
+static unsigned char virtual_color_byte(float value)
+{
+    return static_cast<unsigned char>(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
+}
+
+static std::string encode_virtual_face_color(const Slic3r::RGBA &color)
+{
+    char buf[9];
+    ::snprintf(buf, sizeof(buf), "%02X%02X%02X%02X",
+        virtual_color_byte(color[0]),
+        virtual_color_byte(color[1]),
+        virtual_color_byte(color[2]),
+        virtual_color_byte(color[3]));
+    return buf;
+}
+
+static bool decode_hex_byte(const std::string &text, size_t offset, unsigned char &value)
+{
+    auto hex_value = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9')
+            return ch - '0';
+        if (ch >= 'A' && ch <= 'F')
+            return 10 + ch - 'A';
+        if (ch >= 'a' && ch <= 'f')
+            return 10 + ch - 'a';
+        return -1;
+    };
+
+    const int high = hex_value(text[offset]);
+    const int low = hex_value(text[offset + 1]);
+    if (high < 0 || low < 0)
+        return false;
+
+    value = static_cast<unsigned char>((high << 4) | low);
+    return true;
+}
+
+static bool decode_virtual_face_color(const std::string &text, Slic3r::RGBA &color)
+{
+    if (text.size() != 6 && text.size() != 8)
+        return false;
+
+    unsigned char r = 0;
+    unsigned char g = 0;
+    unsigned char b = 0;
+    unsigned char a = 255;
+    if (!decode_hex_byte(text, 0, r) || !decode_hex_byte(text, 2, g) || !decode_hex_byte(text, 4, b))
+        return false;
+    if (text.size() == 8 && !decode_hex_byte(text, 6, a))
+        return false;
+
+    color = { float(r) / 255.f, float(g) / 255.f, float(b) / 255.f, float(a) / 255.f };
+    return true;
+}
 
 static constexpr const char* OBJECT_TYPE = "object";
 static constexpr const char* VOLUME_TYPE = "volume";
@@ -419,6 +477,7 @@ ModelVolumeType type_from_string(const std::string &s)
             std::vector<std::string> custom_seam;
             std::vector<std::string> mmu_segmentation;
             std::vector<std::string> fuzzy_skin;
+            std::vector<std::string> virtual_face_colors;
 
             bool empty() { return vertices.empty() || triangles.empty(); }
 
@@ -429,6 +488,7 @@ ModelVolumeType type_from_string(const std::string &s)
                 custom_seam.clear();
                 mmu_segmentation.clear();
                 fuzzy_skin.clear();
+                virtual_face_colors.clear();
             }
         };
 
@@ -1744,6 +1804,7 @@ ModelVolumeType type_from_string(const std::string &s)
         m_curr_object.geometry.custom_seam.push_back(get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
         m_curr_object.geometry.fuzzy_skin.push_back(get_attribute_value_string(attributes, num_attributes, FUZZY_SKIN_ATTR));
         m_curr_object.geometry.mmu_segmentation.push_back(get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
+        m_curr_object.geometry.virtual_face_colors.push_back(get_attribute_value_string(attributes, num_attributes, VIRTUAL_FACE_COLOR_ATTR));
         return true;
     }
 
@@ -2161,11 +2222,15 @@ ModelVolumeType type_from_string(const std::string &s)
             volume->seam_facets.reserve(triangles_count);
             volume->mmu_segmentation_facets.reserve(triangles_count);
             volume->fuzzy_skin_facets.reserve(triangles_count);
+            std::vector<RGBA> virtual_face_colors;
+            virtual_face_colors.reserve(triangles_count);
+            bool has_virtual_face_colors = false;
             for (size_t i=0; i<triangles_count; ++i) {
                 size_t index = volume_data.first_triangle_id + i;
                 assert(index < geometry.custom_supports.size());
                 assert(index < geometry.custom_seam.size());
                 assert(index < geometry.mmu_segmentation.size());
+                assert(index < geometry.virtual_face_colors.size());
                 if (! geometry.custom_supports[index].empty())
                     volume->supported_facets.set_triangle_from_string(i, geometry.custom_supports[index]);
                 if (! geometry.custom_seam[index].empty())
@@ -2174,11 +2239,19 @@ ModelVolumeType type_from_string(const std::string &s)
                     volume->mmu_segmentation_facets.set_triangle_from_string(i, geometry.mmu_segmentation[index]);
                 if (! geometry.fuzzy_skin[index].empty())
                 	volume->fuzzy_skin_facets.set_triangle_from_string(i, geometry.fuzzy_skin[index]);
+                RGBA color = {1.f, 1.f, 1.f, 1.f};
+                if (!geometry.virtual_face_colors[index].empty() && decode_virtual_face_color(geometry.virtual_face_colors[index], color))
+                    has_virtual_face_colors = true;
+                virtual_face_colors.emplace_back(color);
             }
             volume->supported_facets.shrink_to_fit();
             volume->seam_facets.shrink_to_fit();
             volume->mmu_segmentation_facets.shrink_to_fit();
             volume->fuzzy_skin_facets.shrink_to_fit();
+            if (has_virtual_face_colors && virtual_face_colors.size() == triangles_count) {
+                volume->virtual_face_colors = std::move(virtual_face_colors);
+                volume->invalidate_color_synthesis_facets();
+            }
 
             // apply the remaining volume's metadata
             for (const Metadata& metadata : volume_data.metadata) {
@@ -2838,6 +2911,14 @@ ModelVolumeType type_from_string(const std::string &s)
                     output_buffer += FUZZY_SKIN_ATTR;
                     output_buffer += "=\"";
                     output_buffer += fuzzy_skin_data_string;
+                    output_buffer += "\"";
+                }
+
+                if (volume->has_virtual_face_colors()) {
+                    output_buffer += " ";
+                    output_buffer += VIRTUAL_FACE_COLOR_ATTR;
+                    output_buffer += "=\"";
+                    output_buffer += encode_virtual_face_color(volume->virtual_face_colors[i]);
                     output_buffer += "\"";
                 }
 

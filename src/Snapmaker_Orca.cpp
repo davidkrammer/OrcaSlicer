@@ -1559,6 +1559,11 @@ int CLI::run(int argc, char **argv)
 
                     for (ModelObject* o : model.objects)
                     {
+                        if (o->instances.empty()) {
+                            BOOST_LOG_TRIVIAL(info) << "object " << o->name << " had no instances after import; adding default instance before CLI processing";
+                            o->add_instance();
+                        }
+
                         if (object_extruder_id != 0) {
                             o->config.set_key_value("extruder", new ConfigOptionInt(object_extruder_id));
                         }

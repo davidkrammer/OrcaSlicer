@@ -27,6 +27,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <cmath>
+#include <unordered_map>
 
 #include <boost/log/trivial.hpp>
 
@@ -227,6 +229,8 @@ GLVolume::GLVolume(float r, float g, float b, float a)
     color = {r, g, b, a};
     set_render_color(color);
     mmuseg_ts = 0;
+    mmuseg_virtual_color_render = false;
+    mmuseg_virtual_face_count = 0;
 }
 
 // BBS
@@ -526,20 +530,81 @@ void GLVolume::simple_render(GLShaderProgram*        shader,
         if (volume_idx() >= model_object->volumes.size())
             break;
         model_volume = model_object->volumes[volume_idx()];
-        if (model_volume->mmu_segmentation_facets.empty())
+
+        if (model_volume->has_virtual_face_colors()) {
+            color_volume = true;
+            if (!picking && (!mmuseg_virtual_color_render ||
+                             mmuseg_virtual_face_count != model_volume->virtual_face_colors.size() ||
+                             mmuseg_models.empty())) {
+                struct VirtualColorBucket {
+                    indexed_triangle_set its;
+                    ColorRGBA            color;
+                };
+
+                std::vector<VirtualColorBucket> buckets;
+                std::unordered_map<int, size_t> bucket_by_key;
+                const indexed_triangle_set &its = model_volume->mesh().its;
+
+                auto quantize_channel = [](float value) {
+                    return std::clamp(int(std::round(std::clamp(value, 0.f, 1.f) * 9.f)), 0, 9);
+                };
+
+                buckets.reserve(std::min<size_t>(model_volume->virtual_face_colors.size(), 1000));
+                for (size_t face_idx = 0; face_idx < model_volume->virtual_face_colors.size(); ++face_idx) {
+                    const RGBA &color = model_volume->virtual_face_colors[face_idx];
+                    const int r = quantize_channel(color[0]);
+                    const int g = quantize_channel(color[1]);
+                    const int b = quantize_channel(color[2]);
+                    const int key = r * 100 + g * 10 + b;
+
+                    auto [it, inserted] = bucket_by_key.emplace(key, buckets.size());
+                    if (inserted) {
+                        buckets.push_back({indexed_triangle_set(), ColorRGBA(float(r) / 9.f, float(g) / 9.f, float(b) / 9.f, 1.f)});
+                    }
+
+                    VirtualColorBucket &bucket = buckets[it->second];
+                    const stl_triangle_vertex_indices &face = its.indices[face_idx];
+                    const int base = int(bucket.its.vertices.size());
+                    bucket.its.vertices.emplace_back(its.vertices[face[0]]);
+                    bucket.its.vertices.emplace_back(its.vertices[face[1]]);
+                    bucket.its.vertices.emplace_back(its.vertices[face[2]]);
+                    bucket.its.indices.emplace_back(stl_triangle_vertex_indices(base, base + 1, base + 2));
+                }
+
+                mmuseg_models.clear();
+                mmuseg_model_colors.clear();
+                mmuseg_models.resize(buckets.size());
+                mmuseg_model_colors.reserve(buckets.size());
+                for (size_t idx = 0; idx < buckets.size(); ++idx) {
+                    mmuseg_model_colors.emplace_back(buckets[idx].color);
+                    if (!buckets[idx].its.indices.empty())
+                        mmuseg_models[idx].init_from(buckets[idx].its);
+                }
+                mmuseg_virtual_color_render = true;
+                mmuseg_virtual_face_count = model_volume->virtual_face_colors.size();
+                mmuseg_ts = 0;
+            }
+            break;
+        }
+
+        const FacetsAnnotation *facets = &model_volume->mmu_segmentation_facets;
+        if (facets->empty())
             break;
 
         color_volume = true;
-        if (model_volume->mmu_segmentation_facets.timestamp() != mmuseg_ts) {
+        if (facets->timestamp() != mmuseg_ts) {
             mmuseg_models.clear();
+            mmuseg_model_colors.clear();
             std::vector<indexed_triangle_set> its_per_color;
-            model_volume->mmu_segmentation_facets.get_facets(*model_volume, its_per_color);
+            facets->get_facets(*model_volume, its_per_color);
             mmuseg_models.resize(its_per_color.size());
             for (int idx = 0; idx < its_per_color.size(); idx++) {
                 mmuseg_models[idx].init_from(its_per_color[idx]);
             }
 
-            mmuseg_ts = model_volume->mmu_segmentation_facets.timestamp();
+            mmuseg_ts = facets->timestamp();
+            mmuseg_virtual_color_render = false;
+            mmuseg_virtual_face_count = 0;
         }
     } while (0);
 
@@ -556,7 +621,12 @@ void GLVolume::simple_render(GLShaderProgram*        shader,
                 continue;
 
             if (shader) {
-                if (idx == 0) {
+                if (mmuseg_virtual_color_render && size_t(idx) < mmuseg_model_colors.size()) {
+                    ColorRGBA new_color = adjust_color_for_rendering(mmuseg_model_colors[size_t(idx)]);
+                    if (ban_light)
+                        new_color[3] = 1.f;
+                    m.set_color(new_color);
+                } else if (idx == 0) {
                     int extruder_id = model_volume->extruder_id();
                     if (extruder_id <= 0)
                         extruder_id = 1;

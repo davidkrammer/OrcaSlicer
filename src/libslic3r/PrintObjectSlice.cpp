@@ -2,7 +2,15 @@
 
 #include <tbb/parallel_for.h>
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cmath>
+#include <limits>
+#include <unordered_map>
+
 #include "ClipperUtils.hpp"
+#include "Color.hpp"
 #include "ElephantFootCompensation.hpp"
 #include "I18N.hpp"
 #include "Layer.hpp"
@@ -842,20 +850,327 @@ void PrintObject::slice()
     this->set_done(posSlice);
 }
 
+static uint8_t color_component_to_byte(float value)
+{
+    return uint8_t(std::clamp(int(std::round(std::clamp(value, 0.f, 1.f) * 255.f)), 0, 255));
+}
+
+static uint32_t virtual_color_key(const RGBA &color)
+{
+    return (uint32_t(color_component_to_byte(color[0])) << 16) |
+           (uint32_t(color_component_to_byte(color[1])) << 8) |
+           uint32_t(color_component_to_byte(color[2]));
+}
+
+static std::array<float, 4> process_weights_for_rgb(ColorSynthesisMode mode, float red, float green, float blue)
+{
+    const float r = std::clamp(red, 0.f, 1.f);
+    const float g = std::clamp(green, 0.f, 1.f);
+    const float b = std::clamp(blue, 0.f, 1.f);
+    const float c = 1.f - r;
+    const float m = 1.f - g;
+    const float y = 1.f - b;
+
+    std::array<float, 4> weights{0.f, 0.f, 0.f, 0.f};
+    switch (mode) {
+    case ColorSynthesisMode::CMY:
+        weights = {c, m, y, 0.f};
+        break;
+    case ColorSynthesisMode::CMYK: {
+        const float k_max = std::min({c, m, y});
+        const float chroma = std::max({c, m, y}) - k_max;
+        const float k_thresh = std::max(0.f, (k_max - 0.35f) / 0.65f);
+        const float k_scale = (1.f - chroma * 0.7f) * k_thresh;
+        const float k = k_max * k_scale;
+        weights = {c - k, m - k, y - k, k};
+        break;
+    }
+    case ColorSynthesisMode::CMYW: {
+        const float shared_gray = std::min({c, m, y});
+        const float white = 1.f - std::max({c, m, y});
+        const float gray_third = shared_gray / 3.f;
+        weights = {c - shared_gray + gray_third, m - shared_gray + gray_third, y - shared_gray + gray_third, white};
+        break;
+    }
+    case ColorSynthesisMode::Standard:
+    default:
+        break;
+    }
+
+    for (float &weight : weights)
+        weight = std::max(0.f, weight);
+    return weights;
+}
+
+static std::vector<unsigned char> process_layer_sequence(const std::array<float, 4> &weights, size_t channels, size_t layer_count)
+{
+    channels = std::min<size_t>(channels, weights.size());
+    layer_count = std::max<size_t>(layer_count, 1);
+
+    std::vector<unsigned char> sequence(layer_count, 0);
+    float total = 0.f;
+    for (size_t channel = 0; channel < channels; ++channel)
+        total += weights[channel];
+
+    if (total <= 0.001f) {
+        const size_t fallback_channels = std::max<size_t>(1, std::min<size_t>(channels, 3));
+        for (size_t layer_idx = 0; layer_idx < layer_count; ++layer_idx)
+            sequence[layer_idx] = static_cast<unsigned char>(layer_idx % fallback_channels);
+        return sequence;
+    }
+
+    std::array<float, 4> fractions{0.f, 0.f, 0.f, 0.f};
+    std::array<size_t, 4> placed{0, 0, 0, 0};
+    for (size_t channel = 0; channel < channels; ++channel)
+        fractions[channel] = weights[channel] / total;
+
+    for (size_t layer_idx = 0; layer_idx < layer_count; ++layer_idx) {
+        size_t best_channel = 0;
+        float best_score = std::numeric_limits<float>::lowest();
+        for (size_t channel = 0; channel < channels; ++channel) {
+            if (fractions[channel] < 0.001f)
+                continue;
+            const float score = fractions[channel] * float(layer_idx + 1) - float(placed[channel]) +
+                                float(channel) * 1e-6f + (layer_idx % channels == channel ? 1e-7f : 0.f);
+            if (score > best_score) {
+                best_score = score;
+                best_channel = channel;
+            }
+        }
+        sequence[layer_idx] = static_cast<unsigned char>(best_channel);
+        ++placed[best_channel];
+    }
+
+    return sequence;
+}
+
+static const char *process_filament_annotation(size_t extruder_id)
+{
+    static constexpr std::array<const char *, 17> states = {
+        "", "4", "8", "0C", "1C", "2C", "3C", "4C", "5C",
+        "6C", "7C", "8C", "9C", "AC", "BC", "CC", "DC"
+    };
+    return extruder_id < states.size() ? states[extruder_id] : "";
+}
+
+struct ProcessColorVertex
+{
+    Vec3f local;
+    float print_z {0.f};
+};
+
+static std::vector<ProcessColorVertex> clip_process_color_polygon_by_z(const std::vector<ProcessColorVertex> &polygon, float z, bool keep_above)
+{
+    if (!std::isfinite(z) || polygon.empty())
+        return polygon;
+
+    std::vector<ProcessColorVertex> out;
+    out.reserve(polygon.size() + 1);
+    auto inside = [z, keep_above](const ProcessColorVertex &v) {
+        return keep_above ? v.print_z >= z - 1e-6f : v.print_z <= z + 1e-6f;
+    };
+
+    for (size_t i = 0; i < polygon.size(); ++i) {
+        const ProcessColorVertex &current = polygon[i];
+        const ProcessColorVertex &next    = polygon[(i + 1) % polygon.size()];
+        const bool current_inside = inside(current);
+        const bool next_inside    = inside(next);
+
+        if (current_inside)
+            out.emplace_back(current);
+
+        if (current_inside != next_inside) {
+            const float dz = next.print_z - current.print_z;
+            const float t  = std::abs(dz) <= 1e-12f ? 0.f : std::clamp((z - current.print_z) / dz, 0.f, 1.f);
+            out.push_back({current.local + t * (next.local - current.local), z});
+        }
+    }
+    return out;
+}
+
+static size_t process_color_layer_band_index(const std::vector<float> &band_boundaries, float z, size_t layer_count)
+{
+    auto it = std::upper_bound(band_boundaries.begin(), band_boundaries.end(), z);
+    if (it == band_boundaries.begin())
+        return 0;
+    return std::min<size_t>(size_t(std::distance(band_boundaries.begin(), it)) - 1, layer_count - 1);
+}
+
+static bool append_process_color_triangle(indexed_triangle_set &its, const Vec3f &a, const Vec3f &b, const Vec3f &c)
+{
+    if (((b - a).cross(c - a)).squaredNorm() <= 1e-16f)
+        return false;
+
+    const int base = int(its.vertices.size());
+    its.vertices.emplace_back(a);
+    its.vertices.emplace_back(b);
+    its.vertices.emplace_back(c);
+    its.indices.emplace_back(base, base + 1, base + 2);
+    return true;
+}
+
+static bool bake_virtual_face_colors_to_process_painting(const PrintObject                 &print_object,
+                                                         const std::vector<float>         &slice_zs,
+                                                         const ModelVolumePtrs            &model_volumes,
+                                                         ModelVolumePtrs                  &painted_model_volumes,
+                                                         std::unique_ptr<Model>            &baked_model,
+                                                         const std::function<void()>      &throw_on_cancel)
+{
+    const ColorSynthesisMode mode = print_object.print()->config().color_synthesis_mode.value;
+    const int channels = color_synthesis_channel_count(mode);
+    if (channels <= 0 || slice_zs.empty())
+        return false;
+
+    const size_t num_extruders = print_object.print()->config().filament_diameter.size();
+    if (num_extruders < size_t(channels))
+        return false;
+
+    std::vector<size_t> colored_volume_indices;
+    for (size_t volume_idx = 0; volume_idx < model_volumes.size(); ++volume_idx) {
+        const ModelVolume *volume = model_volumes[volume_idx];
+        if (volume->is_model_part() && volume->has_virtual_face_colors())
+            colored_volume_indices.push_back(volume_idx);
+    }
+    if (colored_volume_indices.empty())
+        return false;
+
+    const size_t layer_count = slice_zs.size();
+    std::vector<float> band_boundaries(layer_count + 1, 0.f);
+    band_boundaries.front() = -std::numeric_limits<float>::infinity();
+    band_boundaries.back()  =  std::numeric_limits<float>::infinity();
+    for (size_t layer_idx = 1; layer_idx < layer_count; ++layer_idx)
+        band_boundaries[layer_idx] = 0.5f * (slice_zs[layer_idx - 1] + slice_zs[layer_idx]);
+
+    // Inspired by Primed3D's dithered export flow (3DRev/Primed3D, Apache-2.0):
+    // split textured faces into slicer layer-height bands, then assign each band
+    // from the proportional process-color sequence. This implementation stays
+    // inside Orca's pipeline and uses the actual generated slice_zs.
+    BOOST_LOG_TRIVIAL(info) << "Color synthesis - baking textured OBJ colors into layer-banded process-color painting";
+
+    baked_model = std::make_unique<Model>();
+    ModelObject *baked_object = baked_model->add_object(*print_object.model_object());
+    if (baked_object->volumes.size() != model_volumes.size()) {
+        baked_model.reset();
+        return false;
+    }
+
+    bool baked_any_volume = false;
+    ModelVolumePtrs baked_model_volumes = model_volumes;
+    for (size_t volume_idx : colored_volume_indices) {
+        throw_on_cancel();
+        const ModelVolume *volume       = model_volumes[volume_idx];
+        ModelVolume       *baked_volume = baked_object->volumes[volume_idx];
+
+        const indexed_triangle_set &source = volume->mesh().its;
+        indexed_triangle_set baked_its;
+        baked_its.vertices.reserve(source.indices.size() * 3);
+        baked_its.indices.reserve(source.indices.size());
+        baked_volume->virtual_face_colors.clear();
+        baked_volume->invalidate_color_synthesis_facets();
+        baked_volume->mmu_segmentation_facets.reset();
+        baked_volume->mmu_segmentation_facets.reserve(int(source.indices.size()));
+
+        std::unordered_map<uint32_t, std::vector<unsigned char>> sequences;
+        sequences.reserve(std::min<size_t>(volume->virtual_face_colors.size(), 4096));
+
+        const Transform3f transform  = print_object.trafo().cast<float>() * volume->get_matrix().cast<float>();
+        const size_t      face_count = std::min(source.indices.size(), volume->virtual_face_colors.size());
+        size_t            annotated_face_count = 0;
+        size_t            generated_face_count = 0;
+        for (size_t face_idx = 0; face_idx < face_count; ++face_idx) {
+            const stl_triangle_vertex_indices &face = source.indices[face_idx];
+            const RGBA &color = volume->virtual_face_colors[face_idx];
+            const uint32_t color_key = virtual_color_key(color);
+            auto sequence_it = sequences.find(color_key);
+            if (sequence_it == sequences.end()) {
+                sequence_it = sequences.emplace(color_key,
+                    process_layer_sequence(process_weights_for_rgb(mode, color[0], color[1], color[2]), size_t(channels), layer_count)).first;
+            }
+            const std::vector<unsigned char> &sequence = sequence_it->second;
+
+            std::vector<ProcessColorVertex> polygon;
+            polygon.reserve(3);
+            float min_z =  std::numeric_limits<float>::infinity();
+            float max_z = -std::numeric_limits<float>::infinity();
+            for (int vertex_idx = 0; vertex_idx < 3; ++vertex_idx) {
+                const Vec3f local = source.vertices[face[vertex_idx]];
+                const float print_z = (transform * local).z();
+                polygon.push_back({local, print_z});
+                min_z = std::min(min_z, print_z);
+                max_z = std::max(max_z, print_z);
+            }
+
+            const size_t layer_start = process_color_layer_band_index(band_boundaries, min_z, layer_count);
+            const size_t layer_end   = process_color_layer_band_index(band_boundaries, max_z, layer_count);
+            for (size_t layer_idx = layer_start; layer_idx <= layer_end; ++layer_idx) {
+                std::vector<ProcessColorVertex> clipped = clip_process_color_polygon_by_z(polygon, band_boundaries[layer_idx], true);
+                clipped = clip_process_color_polygon_by_z(clipped, band_boundaries[layer_idx + 1], false);
+                if (clipped.size() < 3)
+                    continue;
+
+                const size_t extruder_id = size_t(sequence[layer_idx % sequence.size()]) + 1;
+                const char  *annotation  = process_filament_annotation(extruder_id);
+                if (annotation[0] == '\0')
+                    continue;
+
+                for (size_t vertex_idx = 1; vertex_idx + 1 < clipped.size(); ++vertex_idx) {
+                    const int triangle_id = int(baked_its.indices.size());
+                    if (append_process_color_triangle(baked_its, clipped[0].local, clipped[vertex_idx].local, clipped[vertex_idx + 1].local)) {
+                        baked_volume->mmu_segmentation_facets.set_triangle_from_string(triangle_id, annotation);
+                        ++annotated_face_count;
+                        ++generated_face_count;
+                    }
+                }
+            }
+        }
+
+        if (baked_its.indices.empty() || baked_volume->mmu_segmentation_facets.empty()) {
+            BOOST_LOG_TRIVIAL(warning) << "Color synthesis - process-color bake produced no triangles for volume " << volume->name;
+            continue;
+        }
+
+        baked_volume->set_mesh(std::move(baked_its));
+        baked_volume->mmu_segmentation_facets.shrink_to_fit();
+        baked_model_volumes[volume_idx] = baked_volume;
+        baked_any_volume = true;
+        BOOST_LOG_TRIVIAL(info) << "Color synthesis - baked volume " << volume->name
+                                << ": faces=" << face_count
+                                << ", subfaces=" << generated_face_count
+                                << ", annotated=" << annotated_face_count
+                                << ", unique_colors=" << sequences.size()
+                                << ", layers=" << layer_count
+                                << ", channels=" << channels;
+    }
+
+    if (!baked_any_volume) {
+        baked_model.reset();
+        return false;
+    }
+
+    painted_model_volumes = std::move(baked_model_volumes);
+    return true;
+}
+
 template<typename ThrowOnCancel>
-static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCancel throw_on_cancel)
+static inline void apply_mm_segmentation(PrintObject &print_object, const ModelVolumePtrs &model_volumes, ThrowOnCancel throw_on_cancel,
+                                         IncludeTopAndBottomLayers include_top_and_bottom_layers = IncludeTopAndBottomLayers::Yes)
 {
     // Returns MM segmentation based on painting in MM segmentation gizmo
-    std::vector<std::vector<ExPolygons>> segmentation = multi_material_segmentation_by_painting(print_object, throw_on_cancel);
+    const size_t num_extruders = print_object.print()->config().filament_diameter.size();
+    BOOST_LOG_TRIVIAL(info) << "Color synthesis - MMU segmentation begin"
+                            << ": layers=" << print_object.layer_count()
+                            << ", volumes=" << model_volumes.size()
+                            << ", extruders=" << num_extruders;
+    std::vector<std::vector<ExPolygons>> segmentation = multi_material_segmentation_by_painting(print_object, throw_on_cancel, &model_volumes, include_top_and_bottom_layers);
     assert(segmentation.size() == print_object.layer_count());
+    BOOST_LOG_TRIVIAL(info) << "Color synthesis - MMU segmentation end";
+
     tbb::parallel_for(
         tbb::blocked_range<size_t>(0, segmentation.size(), std::max(segmentation.size() / 128, size_t(1))),
-        [&print_object, &segmentation, throw_on_cancel](const tbb::blocked_range<size_t> &range) {
+        [&print_object, &segmentation, throw_on_cancel, num_extruders](const tbb::blocked_range<size_t> &range) {
             const auto  &layer_ranges   = print_object.shared_regions()->layer_ranges;
             double       z              = print_object.get_layer(int(range.begin()))->slice_z;
             auto         it_layer_range = layer_range_first(layer_ranges, z);
-            // BBS
-            const size_t num_extruders = print_object.print()->config().filament_diameter.size();
 
             struct ByExtruder {
                 ExPolygons  expolygons;
@@ -878,7 +1193,8 @@ static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCance
                 by_extruder.assign(num_extruders, ByExtruder());
                 by_region.assign(layer.region_count(), ByRegion());
                 bool layer_split = false;
-                for (size_t extruder_id = 0; extruder_id < num_extruders; ++ extruder_id) {
+                const size_t segmentation_extruders = std::min(num_extruders, segmentation[layer_id].size());
+                for (size_t extruder_id = 0; extruder_id < segmentation_extruders; ++ extruder_id) {
                     ByExtruder &region = by_extruder[extruder_id];
                     append(region.expolygons, std::move(segmentation[layer_id][extruder_id]));
                     if (! region.expolygons.empty()) {
@@ -924,13 +1240,15 @@ static inline void apply_mm_segmentation(PrintObject &print_object, ThrowOnCance
                         if (!segmented.bbox.defined || !parent_layer_region_bbox.overlap(segmented.bbox))
                             continue;
 
-                        // Find the first target region iterator.
-                        auto it_target_region = std::find_if(it_painted_region_begin, layer_range.painted_regions.cend(), [extruder_id](const auto &painted_region) {
-                            return int(painted_region.extruder_id) >= extruder_id;
+                        // Find the exact painted region for this parent/extruder. Process-color imports can
+                        // generate dense face painting, so don't rely on the release-build asserts below.
+                        auto it_target_region = std::find_if(it_painted_region_begin, layer_range.painted_regions.cend(), [&layer_range, &parent_print_region, extruder_id](const auto &painted_region) {
+                            return int(painted_region.extruder_id) == extruder_id &&
+                                   layer_range.volume_regions[painted_region.parent].region == &parent_print_region;
                         });
 
-                        assert(it_target_region != layer_range.painted_regions.end());
-                        assert(layer_range.volume_regions[it_target_region->parent].region == &parent_print_region && int(it_target_region->extruder_id) == extruder_id);
+                        if (it_target_region == layer_range.painted_regions.end())
+                            continue;
 
                         // Update the beginning PaintedRegion iterator for the next iteration.
                         it_painted_region_begin = it_target_region;
@@ -1138,11 +1456,16 @@ void PrintObject::slice_volumes()
     }
 
     std::vector<float>                   slice_zs      = zs_from_layers(m_layers);
+    ModelVolumePtrs                      model_volumes = this->model_object()->volumes;
+    ModelVolumePtrs                      painting_model_volumes = model_volumes;
+    std::unique_ptr<Model> baked_color_model;
+    const bool baked_process_color_painting = bake_virtual_face_colors_to_process_painting(*this, slice_zs, model_volumes, painting_model_volumes, baked_color_model, throw_on_cancel_callback);
+
     std::vector<VolumeSlices> objSliceByVolume;
     if (!slice_zs.empty()) {
         objSliceByVolume = slice_volumes_inner(
             print->config(), this->config(), this->trafo_centered(),
-            this->model_object()->volumes, m_shared_regions->layer_ranges, slice_zs, throw_on_cancel_callback);
+            model_volumes, m_shared_regions->layer_ranges, slice_zs, throw_on_cancel_callback);
     }
 
     //BBS: "model_part" volumes are grouded according to their connections
@@ -1153,7 +1476,7 @@ void PrintObject::slice_volumes()
     firstLayerObjSliceByVolume = objSliceByVolume;
 
     std::vector<std::vector<ExPolygons>> region_slices =
-        slices_to_regions(print->config(), *this, this->model_object()->volumes, *m_shared_regions, slice_zs,
+        slices_to_regions(print->config(), *this, model_volumes, *m_shared_regions, slice_zs,
                           std::move(objSliceByVolume), PrintObject::clip_multipart_objects, throw_on_cancel_callback);
 
     for (size_t region_id = 0; region_id < region_slices.size(); ++ region_id) {
@@ -1178,9 +1501,11 @@ void PrintObject::slice_volumes()
     this->apply_conical_overhang();
 
     // Is any ModelVolume multi-material painted?
-    if (const auto& volumes = this->model_object()->volumes;
+    if (const auto& volumes = painting_model_volumes;
         m_print->config().filament_diameter.size() > 1 && // BBS
-        std::find_if(volumes.begin(), volumes.end(), [](const ModelVolume* v) { return !v->mmu_segmentation_facets.empty(); }) != volumes.end()) {
+        std::find_if(volumes.begin(), volumes.end(), [](const ModelVolume* v) {
+            return !v->mmu_segmentation_facets.empty();
+        }) != volumes.end()) {
 
         // If XY Size compensation is also enabled, notify the user that XY Size compensation
         // would not be used because the object is multi-material painted.
@@ -1193,7 +1518,8 @@ void PrintObject::slice_volumes()
         }
 
         BOOST_LOG_TRIVIAL(debug) << "Slicing volumes - MMU segmentation";
-        apply_mm_segmentation(*this, [print]() { print->throw_if_canceled(); });
+        apply_mm_segmentation(*this, painting_model_volumes, [print]() { print->throw_if_canceled(); },
+            baked_process_color_painting ? IncludeTopAndBottomLayers::No : IncludeTopAndBottomLayers::Yes);
     }
 
     // Is any ModelVolume fuzzy skin painted?

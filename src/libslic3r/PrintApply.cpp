@@ -77,6 +77,8 @@ static inline void model_volume_list_copy_configs(ModelObject &model_object_dst,
         mv_dst.seam_facets.assign(mv_src.seam_facets);
         assert(mv_dst.mmu_segmentation_facets.id() == mv_src.mmu_segmentation_facets.id());
         mv_dst.mmu_segmentation_facets.assign(mv_src.mmu_segmentation_facets);
+        mv_dst.virtual_face_colors = mv_src.virtual_face_colors;
+        mv_dst.invalidate_color_synthesis_facets();
         assert(mv_dst.fuzzy_skin_facets.id() == mv_src.fuzzy_skin_facets.id());
         mv_dst.fuzzy_skin_facets.assign(mv_src.fuzzy_skin_facets);
         //FIXME what to do with the materials?
@@ -1079,6 +1081,38 @@ static PrintObjectRegions* generate_print_object_regions(
     return out.release();
 }
 
+static bool print_object_regions_match_painting_extruders(const PrintObjectRegions *regions, const std::vector<unsigned int> &painting_extruders)
+{
+    if (regions == nullptr)
+        return painting_extruders.empty();
+
+    for (const PrintObjectRegions::LayerRangeRegions &layer_range : regions->layer_ranges) {
+        size_t paintable_parent_count = 0;
+        for (const PrintObjectRegions::VolumeRegion &volume_region : layer_range.volume_regions) {
+            if (volume_region.model_volume != nullptr && volume_region.region != nullptr &&
+                (volume_region.model_volume->is_model_part() || volume_region.model_volume->is_modifier()))
+                ++paintable_parent_count;
+        }
+
+        if (layer_range.painted_regions.size() != paintable_parent_count * painting_extruders.size())
+            return false;
+
+        for (const PrintObjectRegions::PaintedRegion &painted_region : layer_range.painted_regions) {
+            if (std::find(painting_extruders.begin(), painting_extruders.end(), painted_region.extruder_id) == painting_extruders.end())
+                return false;
+            if (painted_region.parent < 0 || painted_region.parent >= int(layer_range.volume_regions.size()))
+                return false;
+
+            const PrintObjectRegions::VolumeRegion &parent = layer_range.volume_regions[painted_region.parent];
+            if (parent.model_volume == nullptr || parent.region == nullptr ||
+                (!parent.model_volume->is_model_part() && !parent.model_volume->is_modifier()))
+                return false;
+        }
+    }
+
+    return true;
+}
+
 Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_config)
 {
 #ifdef _DEBUG
@@ -1569,22 +1603,44 @@ Print::ApplyStatus Print::apply(const Model &model, DynamicPrintConfig new_full_
         }
         std::vector<unsigned int> painting_extruders;
         if (const auto &volumes = print_object.model_object()->volumes;
-            num_extruders > 1 &&
-            std::find_if(volumes.begin(), volumes.end(), [](const ModelVolume *v) { return ! v->mmu_segmentation_facets.empty(); }) != volumes.end()) {
+            num_extruders > 1) {
+            const bool has_mmu_painting = std::find_if(volumes.begin(), volumes.end(), [](const ModelVolume *v) { return ! v->mmu_segmentation_facets.empty(); }) != volumes.end();
+            const int synthesis_channels = color_synthesis_channel_count(m_config.color_synthesis_mode.value);
+            const bool has_virtual_face_colors =
+                synthesis_channels > 0 &&
+                num_extruders >= synthesis_channels &&
+                std::find_if(volumes.begin(), volumes.end(), [](const ModelVolume *v) { return v->has_virtual_face_colors(); }) != volumes.end();
 
-            std::array<bool, static_cast<size_t>(EnforcerBlockerType::ExtruderMax) + 1> used_facet_states{};
-            for (const ModelVolume *volume : volumes) {
-                const std::vector<bool> &volume_used_facet_states = volume->mmu_segmentation_facets.get_data().used_states;
+            if (has_mmu_painting) {
+                std::array<bool, static_cast<size_t>(EnforcerBlockerType::ExtruderMax) + 1> used_facet_states{};
+                for (const ModelVolume *volume : volumes) {
+                    const std::vector<bool> &volume_used_facet_states = volume->mmu_segmentation_facets.get_data().used_states;
 
-                assert(volume_used_facet_states.size() == used_facet_states.size());
-                for (size_t state_idx = 0; state_idx < std::min(volume_used_facet_states.size(), used_facet_states.size()); ++state_idx)
-                    used_facet_states[state_idx] |= volume_used_facet_states[state_idx];
+                    assert(volume_used_facet_states.size() == used_facet_states.size());
+                    for (size_t state_idx = 0; state_idx < std::min(volume_used_facet_states.size(), used_facet_states.size()); ++state_idx)
+                        used_facet_states[state_idx] |= volume_used_facet_states[state_idx];
+                }
+
+                for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < used_facet_states.size(); ++state_idx) {
+                    if (used_facet_states[state_idx])
+                        painting_extruders.emplace_back(state_idx);
+                }
             }
 
-            for (size_t state_idx = static_cast<size_t>(EnforcerBlockerType::Extruder1); state_idx < used_facet_states.size(); ++state_idx) {
-                if (used_facet_states[state_idx])
-                    painting_extruders.emplace_back(state_idx);
+            if (has_virtual_face_colors || (has_mmu_painting && synthesis_channels > 0 && num_extruders >= synthesis_channels)) {
+                painting_extruders.clear();
+                const size_t first_extruder_state = static_cast<size_t>(EnforcerBlockerType::Extruder1);
+                for (size_t state_idx = first_extruder_state; state_idx < first_extruder_state + size_t(synthesis_channels); ++state_idx)
+                    painting_extruders.emplace_back(unsigned(state_idx));
             }
+        }
+        if (model_object_status.print_object_regions_status == ModelObjectStatus::PrintObjectRegionsStatus::Valid &&
+            !print_object_regions_match_painting_extruders(print_object_regions, painting_extruders)) {
+            BOOST_LOG_TRIVIAL(info) << "Color synthesis - regenerating print regions for process-color painting";
+            for (auto it = it_print_object; it != it_print_object_end; ++it)
+                update_apply_status((*it)->invalidate_all_steps());
+            model_object_status.print_object_regions_status = ModelObjectStatus::PrintObjectRegionsStatus::PartiallyValid;
+            print_regions_reshuffled = true;
         }
         if (model_object_status.print_object_regions_status == ModelObjectStatus::PrintObjectRegionsStatus::Valid) {
             // Verify that the trafo for regions & volume bounding boxes thus for regions is still applicable.
