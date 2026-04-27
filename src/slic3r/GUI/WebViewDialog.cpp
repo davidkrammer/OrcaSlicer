@@ -37,13 +37,14 @@ namespace GUI {
 WebViewPanel::WebViewPanel(wxWindow *parent)
         : wxPanel(parent, wxID_ANY, wxDefaultPosition, wxDefaultSize)
  {
-    wxString url = wxString::FromUTF8(LOCALHOST_URL + std::to_string(wxGetApp().get_page_http_port()) + "/web/flutter_web/index.html?path=1");
+    wxString url = wxString(LOCALHOST_URL) + wxString(std::to_string(wxGetApp().m_page_http_server.get_port())) + wxString("/web/flutter_web/index.html?path=1");
     // wxString url = wxString::Format("file://%s/web/homepage/index.html?path=homepage.html", from_u8(resources_dir()));
     // wxString url     = wxString("http://127.0.0.1:") + wxString(std::to_string(PAGE_HTTP_PORT)) + wxString("/web/flutter_web/index.html?path=1");
     url = wxGetApp().get_international_url(url);
 
     // test
     // url = "http://localhost:13619/web/flutter_web/1.html";
+    m_initial_url = url;
 
     wxBoxSizer* topsizer = new wxBoxSizer(wxVERTICAL);
     
@@ -87,7 +88,7 @@ WebViewPanel::WebViewPanel(wxWindow *parent)
     m_info = new wxInfoBar(this);
     topsizer->Add(m_info, wxSizerFlags().Expand());
     // Create the webview
-    m_browser = WebView::CreateWebView(this, url);
+    m_browser = WebView::CreateWebView(this, wxEmptyString);
 
     wxGetApp().fltviews().add_webview_panel(this, url);
 
@@ -95,7 +96,6 @@ WebViewPanel::WebViewPanel(wxWindow *parent)
         wxLogError("Could not init m_browser");
         return;
     }
-    m_browser->Hide();
     SetSizer(topsizer);
 
     topsizer->Add(m_browser, wxSizerFlags().Expand().Proportion(1));
@@ -223,7 +223,18 @@ WebViewPanel::WebViewPanel(wxWindow *parent)
 
     //Connect the idle events
     Bind(wxEVT_IDLE, &WebViewPanel::OnIdle, this);
+    Bind(wxEVT_SHOW, &WebViewPanel::OnShow, this);
     Bind(wxEVT_CLOSE_WINDOW, &WebViewPanel::OnClose, this);
+
+    CallAfter([this] {
+        if (m_loaded_visible_url || m_initial_url.empty() || m_browser == nullptr || !IsShownOnScreen())
+            return;
+
+        m_loaded_visible_url = true;
+        m_browser->Show();
+        Layout();
+        m_browser->LoadURL(m_initial_url);
+    });
 
     m_LoginUpdateTimer = nullptr;
  }
@@ -248,18 +259,51 @@ WebViewPanel::~WebViewPanel()
 }
 
 void WebViewPanel::reload() {
-    m_browser->Reload();
+    if (m_browser == nullptr)
+        return;
+
+    const wxString current_url = m_browser->GetCurrentURL();
+    if ((current_url.empty() || current_url == "about:blank") && !m_initial_url.empty()) {
+        m_about_blank_retries = 0;
+        m_browser->LoadURL(m_initial_url);
+    } else
+        m_browser->Reload();
 }
 
 void WebViewPanel::load_url(wxString& url)
 {
+    m_initial_url = url;
+    m_loaded_visible_url = false;
+    m_about_blank_retries = 0;
 
-    m_browser->LoadURL(url);
+    if (IsShownOnScreen()) {
+        m_loaded_visible_url = true;
+        m_browser->Show();
+        Layout();
+        m_browser->LoadURL(url);
+    }
 
     wxGetApp().fltviews().add_webview_panel(this, url);
 
     m_browser->SetFocus();
     UpdateState();
+}
+
+void WebViewPanel::OnShow(wxShowEvent& evt)
+{
+    evt.Skip();
+    if (!evt.IsShown() || m_loaded_visible_url || m_initial_url.empty() || m_browser == nullptr)
+        return;
+
+    CallAfter([this] {
+        if (m_loaded_visible_url || m_initial_url.empty() || m_browser == nullptr || !IsShownOnScreen())
+            return;
+
+        m_loaded_visible_url = true;
+        m_browser->Show();
+        Layout();
+        m_browser->LoadURL(m_initial_url);
+    });
 }
 
 /**
@@ -562,7 +606,8 @@ void WebViewPanel::OnNavigationRequest(wxWebViewEvent& evt)
     BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << ": " << evt.GetTarget().ToUTF8().data();
     const wxString &url = evt.GetURL();
     if (url.StartsWith("File://") || url.StartsWith("file://")) {
-        if (!url.Contains("/web/homepage/index.html")) {
+        const bool is_bundled_web_page = url.Contains("/web/homepage/index.html") || url.Contains("/web/flutter_web/");
+        if (!is_bundled_web_page) {
             auto file = wxURL::Unescape(wxURL(url).GetPath());
 #ifdef _WIN32
             if (file.StartsWith('/'))
@@ -618,6 +663,20 @@ void WebViewPanel::OnNavigationComplete(wxWebViewEvent& evt)
 void WebViewPanel::OnDocumentLoaded(wxWebViewEvent& evt)
 {
     BOOST_LOG_TRIVIAL(trace) << __FUNCTION__ << ": " << evt.GetTarget().ToUTF8().data();
+    if ((evt.GetURL().empty() || evt.GetURL() == "about:blank") && !m_initial_url.empty() && m_browser &&
+        IsShownOnScreen() && m_about_blank_retries < 3) {
+        ++m_about_blank_retries;
+        CallAfter([this] {
+            if (m_browser && !m_initial_url.empty() && IsShownOnScreen() &&
+                (m_browser->GetCurrentURL().empty() || m_browser->GetCurrentURL() == "about:blank")) {
+                m_browser->LoadURL(m_initial_url);
+            }
+        });
+        return;
+    }
+    if (evt.GetURL() == m_initial_url)
+        m_about_blank_retries = 0;
+
     // Only notify if the document is the main frame, not a subframe
     if (evt.GetURL() == m_browser->GetCurrentURL())
     {
@@ -625,6 +684,12 @@ void WebViewPanel::OnDocumentLoaded(wxWebViewEvent& evt)
             wxLogMessage("%s", "Document loaded; url='" + evt.GetURL() + "'");
     }
     UpdateState();
+    if (m_browser && IsShownOnScreen()) {
+        CallAfter([this] {
+            if (m_browser && IsShownOnScreen())
+                wxGetApp().page_state_notify_webview(m_browser, "active");
+        });
+    }
 }
 
 void WebViewPanel::OnTitleChanged(wxWebViewEvent &evt)

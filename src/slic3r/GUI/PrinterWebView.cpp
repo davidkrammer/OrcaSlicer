@@ -28,10 +28,11 @@ PrinterWebView::PrinterWebView(wxWindow *parent)
 
     wxBoxSizer* topsizer = new wxBoxSizer(wxVERTICAL);
 
-    wxString url      = wxString::FromUTF8(LOCALHOST_URL + std::to_string(wxGetApp().get_page_http_port()) + "/web/flutter_web/index.html?path=2");
+    wxString url      = wxString(LOCALHOST_URL) + wxString(std::to_string(wxGetApp().m_page_http_server.get_port())) + wxString("/web/flutter_web/index.html?path=2");
     auto     real_url = wxGetApp().get_international_url(url);
+    m_initial_url     = real_url;
       // Create the webview
-    m_browser = WebView::CreateWebView(this, real_url);
+    m_browser = WebView::CreateWebView(this, wxEmptyString);
     if (m_browser == nullptr) {
         wxLogError("Could not init m_browser");
         return;
@@ -51,7 +52,18 @@ PrinterWebView::PrinterWebView(wxWindow *parent)
     m_zoomFactor = 100;
 
     //Connect the idle events
+    Bind(wxEVT_SHOW, &PrinterWebView::OnShow, this);
     Bind(wxEVT_CLOSE_WINDOW, &PrinterWebView::OnClose, this);
+
+    CallAfter([this] {
+        if (m_loaded_visible_url || m_initial_url.empty() || m_browser == nullptr || !IsShownOnScreen())
+            return;
+
+        m_loaded_visible_url = true;
+        m_browser->Show();
+        Layout();
+        m_browser->LoadURL(m_initial_url);
+    });
 
  }
 
@@ -73,6 +85,9 @@ void PrinterWebView::load_url(wxString& url, wxString apikey)
         return;
     m_apikey = apikey;
     m_apikey_sent = false;
+    m_initial_url = url;
+    m_loaded_visible_url = false;
+    m_about_blank_retries = 0;
     
     if (url.find("path=2") != std::string::npos) {
         wxGetApp().fltviews().add_printer_view(this, url, apikey);
@@ -80,15 +95,44 @@ void PrinterWebView::load_url(wxString& url, wxString apikey)
         wxGetApp().fltviews().remove_printer_view(this);
     }
 
-    m_browser->Show();
-    m_browser->LoadURL(url);
+    if (IsShownOnScreen()) {
+        m_loaded_visible_url = true;
+        m_browser->Show();
+        Layout();
+        m_browser->LoadURL(url);
+    }
 
     UpdateState();
 }
 
+void PrinterWebView::OnShow(wxShowEvent& evt)
+{
+    evt.Skip();
+    if (!evt.IsShown() || m_loaded_visible_url || m_initial_url.empty() || m_browser == nullptr)
+        return;
+
+    CallAfter([this] {
+        if (m_loaded_visible_url || m_initial_url.empty() || m_browser == nullptr || !IsShownOnScreen())
+            return;
+
+        m_loaded_visible_url = true;
+        m_browser->Show();
+        Layout();
+        m_browser->LoadURL(m_initial_url);
+    });
+}
+
 void PrinterWebView::reload()
 {
-    m_browser->Reload();
+    if (m_browser == nullptr)
+        return;
+
+    const wxString current_url = m_browser->GetCurrentURL();
+    if ((current_url.empty() || current_url == "about:blank") && !m_initial_url.empty()) {
+        m_about_blank_retries = 0;
+        m_browser->LoadURL(m_initial_url);
+    } else
+        m_browser->Reload();
 }
 
 bool PrinterWebView::isSnapmakerPage()
@@ -182,7 +226,26 @@ void PrinterWebView::OnLoaded(wxWebViewEvent &evt)
 {
     if (evt.GetURL().IsEmpty())
         return;
+    if (evt.GetURL() == "about:blank" && !m_initial_url.empty() && m_browser && IsShownOnScreen() && m_about_blank_retries < 3) {
+        ++m_about_blank_retries;
+        CallAfter([this] {
+            if (m_browser && !m_initial_url.empty() && IsShownOnScreen() &&
+                (m_browser->GetCurrentURL().empty() || m_browser->GetCurrentURL() == "about:blank")) {
+                m_browser->LoadURL(m_initial_url);
+            }
+        });
+        return;
+    }
+    if (evt.GetURL() == m_initial_url)
+        m_about_blank_retries = 0;
+
     SendAPIKey();
+    if (m_browser && IsShownOnScreen()) {
+        CallAfter([this] {
+            if (m_browser && IsShownOnScreen())
+                wxGetApp().page_state_notify_webview(m_browser, "active");
+        });
+    }
 }
 
 void PrinterWebView::OnScriptMessage(wxWebViewEvent& evt) {

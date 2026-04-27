@@ -101,6 +101,25 @@ install_name_tool -change "@rpath/libsentry.dylib" "@executable_path/../Framewor
 /usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_DISPLAY_NAME" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_DISPLAY_NAME" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
 /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $APP_BUNDLE_ID" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSAllowsLocalNetworking bool true" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Set :NSAppTransportSecurity:NSAllowsLocalNetworking true" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Delete :NSAppTransportSecurity:NSExceptionDomains" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains dict" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:localhost dict" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:localhost:NSExceptionAllowsInsecureHTTPLoads bool true" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:localhost:NSIncludesSubdomains bool true" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:localhost. dict" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:localhost.:NSExceptionAllowsInsecureHTTPLoads bool true" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:localhost.:NSIncludesSubdomains bool true" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:127.0.0.1 dict" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:127.0.0.1:NSExceptionAllowsInsecureHTTPLoads bool true" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:127.0.0.1:NSIncludesSubdomains bool true" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Set :NSLocalNetworkUsageDescription Snapmaker Orca Color needs local network access to discover, connect to, and manage your 3D printer." "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || \
+    /usr/libexec/PlistBuddy -c "Add :NSLocalNetworkUsageDescription string Snapmaker Orca Color needs local network access to discover, connect to, and manage your 3D printer." "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Delete :NSBonjourServices" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSBonjourServices array" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSBonjourServices:0 string _http._tcp" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :NSBonjourServices:1 string _printer._tcp" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
 find "$DOWNLOADS_APP" -name '.DS_Store' -delete
 xattr -cr "$DOWNLOADS_APP"
 xattr -d com.apple.FinderInfo "$DOWNLOADS_APP" 2>/dev/null || true

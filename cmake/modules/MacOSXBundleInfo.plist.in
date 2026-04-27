@@ -132,13 +132,46 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>${MACOSX_BUNDLE_COPYRIGHT}</string>
-	<key>NSAppTransportSecurity</key>  
-	<dict>
-		<!-- Disable App Transport Security. Resolves https://github.com/SoftFever/OrcaSlicer/issues/791 -->
-		<key>NSAllowsArbitraryLoads</key>
-		<true/>  
-		<key>NSAllowsArbitraryLoadsInWebContent</key>
-		<true/>
+		<key>NSAppTransportSecurity</key>
+		<dict>
+			<!-- Disable App Transport Security. Resolves https://github.com/SoftFever/OrcaSlicer/issues/791 -->
+			<key>NSAllowsArbitraryLoads</key>
+			<true/>
+			<key>NSAllowsArbitraryLoadsInWebContent</key>
+			<true/>
+			<key>NSAllowsLocalNetworking</key>
+			<true/>
+			<key>NSExceptionDomains</key>
+			<dict>
+				<key>localhost</key>
+				<dict>
+					<key>NSExceptionAllowsInsecureHTTPLoads</key>
+					<true/>
+					<key>NSIncludesSubdomains</key>
+					<true/>
+				</dict>
+				<key>localhost.</key>
+				<dict>
+					<key>NSExceptionAllowsInsecureHTTPLoads</key>
+					<true/>
+					<key>NSIncludesSubdomains</key>
+					<true/>
+				</dict>
+				<key>127.0.0.1</key>
+				<dict>
+					<key>NSExceptionAllowsInsecureHTTPLoads</key>
+					<true/>
+					<key>NSIncludesSubdomains</key>
+					<true/>
+				</dict>
+			</dict>
+		</dict>
+		<key>NSLocalNetworkUsageDescription</key>
+		<string>Snapmaker Orca Color needs local network access to discover, connect to, and manage your 3D printer.</string>
+		<key>NSBonjourServices</key>
+		<array>
+			<string>_http._tcp</string>
+			<string>_printer._tcp</string>
+		</array>
 	</dict>
-</dict>
-</plist>
+	</plist>

@@ -87,6 +87,7 @@ public:
     void OnUseMemoryFS(wxCommandEvent& evt);
     void OnEnableContextMenu(wxCommandEvent& evt);
     void OnEnableDevTools(wxCommandEvent& evt);
+    void OnShow(wxShowEvent& evt);
     void OnClose(wxCloseEvent& evt);
 
     wxTimer * m_LoginUpdateTimer{nullptr};
@@ -156,6 +157,9 @@ private:
     // Last executed JavaScript snippet, for convenience.
     wxString m_javascript;
     wxString m_response_js;
+    wxString m_initial_url;
+    bool     m_loaded_visible_url{false};
+    int      m_about_blank_retries{0};
 
     DECLARE_EVENT_TABLE()
 };

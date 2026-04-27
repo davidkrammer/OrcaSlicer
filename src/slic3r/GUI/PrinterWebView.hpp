@@ -39,6 +39,7 @@ public:
     void load_url(wxString& url, wxString apikey = "");
     void UpdateState();
     void OnClose(wxCloseEvent& evt);
+    void OnShow(wxShowEvent& evt);
     void OnError(wxWebViewEvent& evt);
     void OnLoaded(wxWebViewEvent& evt);
     void OnScriptMessage(wxWebViewEvent& evt);
@@ -55,6 +56,9 @@ private:
     long m_zoomFactor;
     wxString m_apikey;
     bool m_apikey_sent;
+    wxString m_initial_url;
+    bool     m_loaded_visible_url{false};
+    int      m_about_blank_retries{0};
 
     // DECLARE_EVENT_TABLE()
 };

@@ -141,6 +141,7 @@ void session::read_next_line()
         ssOut << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";          // 允许的方法
         ssOut << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"; // 允许的请求头
         ssOut << "Content-Length: 0\r\n";                                         // 无响应体
+        ssOut << "Connection: close\r\n";
         ssOut << "\r\n";                                                          // 头和主体之间的空行（必须）
 
         // 异步发送响应
@@ -169,6 +170,7 @@ void session::read_next_line()
                     }
 
                     const std::string url_str = Http::url_decode(headers.get_url());
+                    BOOST_LOG_TRIVIAL(debug) << "Local web request: " << headers.method << " " << url_str;
                     const auto        resp    = server.server.m_request_handler(url_str);
                     std::stringstream ssOut;
                     resp->write_response(ssOut);
@@ -229,15 +231,31 @@ void HttpServer::IOServer::stop_all()
 HttpServer::IOServer::IOServer(HttpServer& server) : server(server), acceptor(io_service)
 {
     try {
-        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::tcp::v4(), server.port);
+        boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::tcp::v6(), server.port);
         acceptor.open(endpoint.protocol());
         acceptor.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+        acceptor.set_option(boost::asio::ip::v6_only(false));
         acceptor.bind(endpoint);
     } 
     catch (const boost::system::system_error& errorInfo)
     {
-        BOOST_LOG_TRIVIAL(error) << "local server start failed with port:" << server.port;
-        BOOST_LOG_TRIVIAL(error) << "local server start failed with errorInfo:" << errorInfo.what();
+        BOOST_LOG_TRIVIAL(warning) << "local server dual-stack bind failed with port:" << server.port;
+        BOOST_LOG_TRIVIAL(warning) << "local server dual-stack bind failed with errorInfo:" << errorInfo.what();
+
+        boost::system::error_code ignored_ec;
+        acceptor.close(ignored_ec);
+
+        try {
+            boost::asio::ip::tcp::endpoint endpoint(boost::asio::ip::tcp::v4(), server.port);
+            acceptor.open(endpoint.protocol());
+            acceptor.set_option(boost::asio::ip::tcp::acceptor::reuse_address(true));
+            acceptor.bind(endpoint);
+        }
+        catch (const boost::system::system_error& fallbackError)
+        {
+            BOOST_LOG_TRIVIAL(error) << "local server start failed with port:" << server.port;
+            BOOST_LOG_TRIVIAL(error) << "local server start failed with errorInfo:" << fallbackError.what();
+        }
     }
 }
 
@@ -781,10 +799,11 @@ void HttpServer::ResponseRedirect::write_response(std::stringstream& ssOut)
 
     ssOut << "HTTP/1.1 302 Found\r\n";
     ssOut << "Location: " << location_str << "\r\n";
-    ssOut << "Content-Type: text/html\r\n";
-    ssOut << "Content-Length: " << content_length << "\r\n"; // 正确计算长度
-    ssOut << "Access-Control-Allow-Origin: *\r\n";           // CORS头
-    ssOut << "\r\n";                                         // 头和主体之间的空行（必须）
+        ssOut << "Content-Type: text/html\r\n";
+        ssOut << "Content-Length: " << content_length << "\r\n"; // 正确计算长度
+        ssOut << "Access-Control-Allow-Origin: *\r\n";           // CORS头
+        ssOut << "Connection: close\r\n";
+        ssOut << "\r\n";                                         // 头和主体之间的空行（必须）
     ssOut << sHTML;                                          // 响应体（长度必须匹配）
 }
 
@@ -797,6 +816,7 @@ void HttpServer::ResponseNotFound::write_response(std::stringstream& ssOut)
     ssOut << "Content-Type: text/html\r\n";
     ssOut << "Content-Length: " << content_length << "\r\n"; // 正确计算长度
     ssOut << "Access-Control-Allow-Origin: *\r\n";           // CORS头
+    ssOut << "Connection: close\r\n";
     ssOut << "\r\n";                                         // 头和主体之间的空行（必须）
     ssOut << sHTML;                                          // 响应体（长度必须匹配）
 }
@@ -853,6 +873,7 @@ void HttpServer::ResponseFile::write_response(std::stringstream& ssOut)
     ssOut << "Access-Control-Allow-Origin: *\r\n";           // CORS头
     ssOut << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n";
     ssOut << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n";
+    ssOut << "Connection: close\r\n";
     ssOut << "\r\n";      // 头和主体之间的空行（必须）
     ssOut << fileContent; // 响应体（长度必须与Content-Length一致）
 }

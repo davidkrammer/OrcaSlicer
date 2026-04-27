@@ -1089,6 +1089,10 @@ void MainFrame::init_tabpanel() {
             if (m_webview) {
                 wxWebView* home_webview = m_webview->getWebView();
                 wxGetApp().page_state_notify_webview(home_webview, "active");
+                CallAfter([this] {
+                    if (m_webview)
+                        m_webview->reload();
+                });
             }
             prev_monitored_tab = tpHome;
         } else if (sel == tpMonitor) {
@@ -1096,6 +1100,10 @@ void MainFrame::init_tabpanel() {
             if (m_printer_view) {
                 wxWebView* printer_webview = m_printer_view->get_browser();
                 wxGetApp().page_state_notify_webview(printer_webview, "active");
+                CallAfter([this] {
+                    if (m_printer_view)
+                        m_printer_view->reload();
+                });
             }
             prev_monitored_tab = tpMonitor;
         } else {
@@ -3513,6 +3521,22 @@ void MainFrame::select_tab(size_t tab/* = size_t(-1)*/)
             if (cur_tab)
                 cur_tab->OnActivate();
         }
+
+        if (new_selection == tpHome && m_webview) {
+            CallAfter([this] {
+                if (m_webview) {
+                    wxGetApp().page_state_notify_webview(m_webview->getWebView(), "active");
+                    m_webview->reload();
+                }
+            });
+        } else if (new_selection == tpMonitor && m_printer_view) {
+            CallAfter([this] {
+                if (m_printer_view) {
+                    wxGetApp().page_state_notify_webview(m_printer_view->get_browser(), "active");
+                    m_printer_view->reload();
+                }
+            });
+        }
     };
 
     select(false);
@@ -3683,14 +3707,9 @@ size_t MainFrame::FileHistory::FindFileInHistory(const wxString & file)
 
 void MainFrame::FileHistory::LoadThumbnails()
 {
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, GetCount()), [this](tbb::blocked_range<size_t> range) {
-        for (size_t i = range.begin(); i < range.end(); ++i) {
-            auto thumbnail = bbs_3mf_get_thumbnail(into_u8(GetHistoryFile(i)).c_str());
-            if (!thumbnail.empty()) {
-                m_thumbnails[i] = thumbnail;
-            }
-        }
-    });
+    // Do not block app startup on recent project thumbnails. Some recent files
+    // may live on offline/cloud/network locations, and opening them here can
+    // stall the main window before it is shown.
     m_load_called = true;
 }
 
