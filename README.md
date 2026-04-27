@@ -1,16 +1,32 @@
+# Snapmaker Orca Color
 
-<h1> <p "font-size:200px;"> Snapmaker Orca</p> </h1>
+Snapmaker Orca Color is an experimental fork of Snapmaker Orca focused on textured OBJ import and process-color slicing for multi-filament color printing.
 
-[![Build all](https://github.com/Snapmaker/OrcaSlicer/actions/workflows/build_all.yml/badge.svg?branch=main)](https://github.com/Snapmaker/OrcaSlicer/actions/workflows/build_all.yml)
-<br>Snapmaker Orca is an open source slicer for FDM printers based on OrcaSlicer.
- 
+This fork is based on Snapmaker Orca 2.3.2 and keeps the normal Snapmaker Orca workflow for standard single-color, painted, and multi-material slicing. The color-synthesis controls only appear when a model contains texture-derived virtual face colors from a textured OBJ import.
 
+## What This Fork Enables
 
-# Download
+- Textured OBJ import with OBJ + MTL + PNG/JPG texture support.
+- Full-color preview from texture-sampled virtual face colors instead of reducing the model to the physical filament colors.
+- CMY, CMYK, and CMYW process-color slicing modes below the filament selector.
+- Layer-banded color conversion using the actual slicer Z bands, so the process-color transform matches the selected layer height.
+- Automatic filament color locking for CMY/CMYK/CMYW modes.
+- Simplification that preserves imported virtual color information.
+- A refreshed rainbow app icon without the old BETA label.
 
-### Stable Release
-📥 **[Download the Latest Stable Release](https://github.com/Snapmaker/OrcaSlicer/releases/latest)**  
-Visit our GitHub Releases page for the latest stable version of Snapmaker Slicer, recommended for most users.
+The process-color bake is inspired by Primed3D's dithered export flow: https://github.com/3DRev/Primed3D. No Primed3D source code was copied; this implementation is independent inside Orca's slicing pipeline.
+
+## Download
+
+Download the latest fork build from:
+
+https://github.com/davidkrammer/Snapmaker-Orca-Color/releases/latest
+
+Current public build:
+
+- macOS Apple Silicon / arm64 only.
+- Ad-hoc signed and not Apple notarized.
+- Experimental: verify sliced output before using it on a real printer.
 
 # How to install
 **Windows**: 
@@ -25,25 +41,15 @@ Visit our GitHub Releases page for the latest stable version of Snapmaker Slicer
           -  This file may already be available on your computer if you've installed visual studio.  Check the following location: `%VCINSTALLDIR%Redist\MSVC\v142`
 
 **Mac**:
-1. Download the DMG for your computer: `arm64` version for Apple Silicon and `x86_64` for Intel CPU.  
-2. Drag Snapmaker_Orca.app to Application folder. 
-3. *If you want to run a build from a PR, you also need to follow the instructions below:*  
-    <details quarantine>
-    - Option 1 (You only need to do this once. After that the app can be opened normally.):
-      - Step 1: Hold _cmd_ and right click the app, from the context menu choose **Open**.
-      - Step 2: A warning window will pop up, click _Open_  
-      
-    - Option 2:  
-      Execute this command in terminal: `xattr -dr com.apple.quarantine /Applications/Snapmaker_Orca.app`
-      ```console
-          softfever@mac:~$ xattr -dr com.apple.quarantine /Applications/Snapmaker_Orca.app
-      ```
-    - Option 3:  
-        - Step 1: open the app, a warning window will pop up  
-            ![image](./SoftFever_doc/mac_cant_open.png)  
-        - Step 2: in `System Settings` -> `Privacy & Security`, click `Open Anyway`:  
-            ![image](./SoftFever_doc/mac_security_setting.png)  
-    </details>
+1. Download `Snapmaker-Orca-Color-v*-macOS-arm64.zip` from this fork's [release page](https://github.com/davidkrammer/Snapmaker-Orca-Color/releases/latest).
+2. Unzip it and move `Snapmaker Orca.app` to `/Applications`.
+3. Try right-clicking the app and choosing **Open**.
+4. If macOS still refuses to launch it, remove the quarantine flag:
+   ```console
+   xattr -dr com.apple.quarantine "/Applications/Snapmaker Orca.app"
+   ```
+
+The current macOS release is ad-hoc signed and not notarized with an Apple Developer ID. That is why `Privacy & Security -> Open Anyway` may not be enough on some systems. A fully public macOS release needs Developer ID signing plus Apple notarization.
     
 **Linux (Ubuntu)**:
  1. If you run into trouble executing it, try this command in the terminal:  
