@@ -42,11 +42,11 @@ Current public build:
 
 **Mac**:
 1. Download `Snapmaker-Orca-Color-v*-macOS-arm64.zip` from this fork's [release page](https://github.com/davidkrammer/Snapmaker-Orca-Color/releases/latest).
-2. Unzip it and move `Snapmaker Orca.app` to `/Applications`.
+2. Unzip it and move `Snapmaker Orca Color.app` to `/Applications`.
 3. Try right-clicking the app and choosing **Open**.
 4. If macOS still refuses to launch it, remove the quarantine flag:
    ```console
-   xattr -dr com.apple.quarantine "/Applications/Snapmaker Orca.app"
+   xattr -dr com.apple.quarantine "/Applications/Snapmaker Orca Color.app"
    ```
 
 The current macOS release is ad-hoc signed and not notarized with an Apple Developer ID. That is why `Privacy & Security -> Open Anyway` may not be enough on some systems. A fully public macOS release needs Developer ID signing plus Apple notarization.

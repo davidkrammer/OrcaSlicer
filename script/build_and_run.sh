@@ -52,8 +52,12 @@ PACKAGED_APP="$BUILD_DIR/Snapmaker_Orca/Snapmaker Orca.app"
 PACKAGED_BIN="$PACKAGED_APP/Contents/MacOS/Snapmaker_Orca"
 BUILT_BIN="$BUILD_DIR/src/$CONFIG/Snapmaker_Orca.app/Contents/MacOS/Snapmaker_Orca"
 DOWNLOADS_DIR="$HOME/Downloads/OrcaSlicer-colored-obj-cmy-build"
-DOWNLOADS_APP="$DOWNLOADS_DIR/Snapmaker Orca.app"
+APP_DISPLAY_NAME="${APP_DISPLAY_NAME:-Snapmaker Orca Color}"
+APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.davidkrammer.snapmaker-orca-color}"
+DOWNLOADS_APP="$DOWNLOADS_DIR/$APP_DISPLAY_NAME.app"
 DOWNLOADS_BIN="$DOWNLOADS_APP/Contents/MacOS/Snapmaker_Orca"
+DOWNLOADS_FRAMEWORKS="$DOWNLOADS_APP/Contents/Frameworks"
+ZSTD_DYLIB="${ZSTD_DYLIB:-/opt/homebrew/opt/zstd/lib/libzstd.1.dylib}"
 
 if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
     echo "Missing configured build directory: $BUILD_DIR" >&2
@@ -83,10 +87,21 @@ if [[ "$REFRESH_BUNDLE" == "1" || ! -d "$DOWNLOADS_APP" ]]; then
 fi
 
 cp "$BUILT_BIN" "$DOWNLOADS_BIN"
+if [[ -f "$ZSTD_DYLIB" ]]; then
+    mkdir -p "$DOWNLOADS_FRAMEWORKS"
+    cp "$ZSTD_DYLIB" "$DOWNLOADS_FRAMEWORKS/libzstd.1.dylib"
+    chmod u+w "$DOWNLOADS_FRAMEWORKS/libzstd.1.dylib" 2>/dev/null || true
+    install_name_tool -id "@executable_path/../Frameworks/libzstd.1.dylib" "$DOWNLOADS_FRAMEWORKS/libzstd.1.dylib" 2>/dev/null || true
+    install_name_tool -change "$ZSTD_DYLIB" "@executable_path/../Frameworks/libzstd.1.dylib" "$DOWNLOADS_BIN" 2>/dev/null || true
+fi
 install_name_tool -change "@rpath/libsentry.dylib" "@executable_path/../Frameworks/libsentry.dylib" "$DOWNLOADS_BIN" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Set :CFBundleName $APP_DISPLAY_NAME" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $APP_DISPLAY_NAME" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $APP_BUNDLE_ID" "$DOWNLOADS_APP/Contents/Info.plist" 2>/dev/null || true
 find "$DOWNLOADS_APP" -name '.DS_Store' -delete
 xattr -cr "$DOWNLOADS_APP"
 xattr -d com.apple.FinderInfo "$DOWNLOADS_APP" 2>/dev/null || true
+codesign --force --sign - "$DOWNLOADS_FRAMEWORKS/libzstd.1.dylib" 2>/dev/null || true
 codesign --force --deep --sign - "$DOWNLOADS_APP" >/dev/null
 
 APP_TO_OPEN="$DOWNLOADS_APP"

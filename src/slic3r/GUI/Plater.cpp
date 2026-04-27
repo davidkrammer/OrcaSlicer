@@ -2041,7 +2041,8 @@ Sidebar::Sidebar(Plater *parent)
     auto *sizer = new wxBoxSizer(wxVERTICAL);
     sizer->Add(p->scrolled, 1, wxEXPAND);
     SetSizer(sizer);
-    update_color_synthesis_visibility();
+    if (p->m_color_synthesis_panel)
+        p->m_color_synthesis_panel->Hide();
 }
 
 Sidebar::~Sidebar() {}
@@ -3035,7 +3036,7 @@ void Sidebar::show_SEMM_buttons(bool bshow)
 
 void Sidebar::update_color_synthesis_visibility()
 {
-    if (p->m_color_synthesis_panel == nullptr)
+    if (p->m_color_synthesis_panel == nullptr || p->plater == nullptr)
         return;
 
     const bool show = model_has_texture_derived_colors(p->plater->model());
@@ -10495,6 +10496,7 @@ Plater::Plater(wxWindow *parent, MainFrame *main_frame)
     , p(new priv(this, main_frame))
 {
     // Initialization performed in the private c-tor
+    p->sidebar->update_color_synthesis_visibility();
     enable_wireframe(true);
     m_only_gcode = false;
 }
