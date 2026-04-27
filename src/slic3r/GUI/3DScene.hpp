@@ -213,6 +213,9 @@ public:
     std::unique_ptr<GUI::MeshRaycaster> mesh_raycaster;
     // BBS
     mutable std::vector<GUI::GLModel> mmuseg_models;
+    mutable std::vector<ColorRGBA>     mmuseg_model_colors;
+    mutable bool                       mmuseg_virtual_color_render { false };
+    mutable size_t                     mmuseg_virtual_face_count { 0 };
     mutable ObjectBase::Timestamp       mmuseg_ts;
 
     // Ranges of triangle and quad indices to be rendered.

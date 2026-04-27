@@ -3,8 +3,12 @@
 #include "common_func/common_func.hpp"
 
 #include <cstddef>
+#include <cctype>
+#include <cstring>
 #include <algorithm>
+#include <fstream>
 #include <numeric>
+#include <sstream>
 #include <vector>
 #include <set>
 #include <string>
@@ -31,6 +35,7 @@
 #include <wx/dnd.h>
 #include <wx/progdlg.h>
 #include <wx/string.h>
+#include <wx/stdpaths.h>
 #include <wx/wupdlock.h>
 #include <wx/numdlg.h>
 #include <wx/debug.h>
@@ -173,6 +178,245 @@ static const std::pair<unsigned int, unsigned int> THUMBNAIL_SIZE_3MF = { 512, 5
 
 namespace Slic3r {
 namespace GUI {
+
+namespace {
+
+static std::string trim_copy(const std::string &value)
+{
+    const auto begin = value.find_first_not_of(" \t\r\n");
+    if (begin == std::string::npos)
+        return {};
+    const auto end = value.find_last_not_of(" \t\r\n");
+    return value.substr(begin, end - begin + 1);
+}
+
+static bool starts_with_obj_token(const std::string &line, const char *token)
+{
+    const std::string trimmed = trim_copy(line);
+    const size_t token_len = std::strlen(token);
+    return trimmed.size() > token_len && trimmed.compare(0, token_len, token) == 0 && std::isspace(static_cast<unsigned char>(trimmed[token_len]));
+}
+
+static std::string line_payload_after_token(const std::string &line, const char *token)
+{
+    std::string trimmed = trim_copy(line);
+    const size_t comment = trimmed.find('#');
+    if (comment != std::string::npos)
+        trimmed = trim_copy(trimmed.substr(0, comment));
+
+    const size_t token_len = std::strlen(token);
+    if (trimmed.size() <= token_len)
+        return {};
+    return trim_copy(trimmed.substr(token_len));
+}
+
+static std::vector<std::string> parse_obj_mtllibs(const fs::path &obj_path)
+{
+    std::ifstream stream(obj_path.string());
+    std::vector<std::string> mtllibs;
+    for (std::string line; std::getline(stream, line);) {
+        if (starts_with_obj_token(line, "mtllib")) {
+            const std::string value = line_payload_after_token(line, "mtllib");
+            if (!value.empty())
+                mtllibs.emplace_back(value);
+        }
+    }
+    return mtllibs;
+}
+
+static std::string last_mtl_payload_token(std::string value)
+{
+    value = trim_copy(value);
+    if (value.empty())
+        return {};
+
+    std::istringstream stream(value);
+    std::string token;
+    std::string last_path_token;
+    while (stream >> token)
+        if (!token.empty() && token.front() != '-')
+            last_path_token = token;
+    return last_path_token.empty() ? value : last_path_token;
+}
+
+static std::vector<std::string> parse_mtl_texture_maps(const fs::path &mtl_path)
+{
+    std::ifstream stream(mtl_path.string());
+    std::vector<std::string> maps;
+    for (std::string line; std::getline(stream, line);) {
+        if (starts_with_obj_token(line, "map_Kd")) {
+            const std::string value = last_mtl_payload_token(line_payload_after_token(line, "map_Kd"));
+            if (!value.empty())
+                maps.emplace_back(value);
+        }
+    }
+    return maps;
+}
+
+static fs::path resolve_obj_asset_path(const fs::path &base_file, const std::string &asset)
+{
+    fs::path asset_path(asset);
+    return asset_path.is_absolute() ? asset_path : base_file.parent_path() / asset_path;
+}
+
+static bool has_supported_texture_extension(const fs::path &path)
+{
+    return boost::algorithm::iends_with(path.string(), ".png");
+}
+
+static bool obj_has_complete_color_texture_set(const fs::path &obj_path)
+{
+    for (const std::string &mtllib : parse_obj_mtllibs(obj_path)) {
+        const fs::path mtl_path = resolve_obj_asset_path(obj_path, mtllib);
+        if (!fs::exists(mtl_path))
+            continue;
+
+        for (const std::string &texture : parse_mtl_texture_maps(mtl_path)) {
+            const fs::path texture_path = resolve_obj_asset_path(mtl_path, texture);
+            if (fs::exists(texture_path) && has_supported_texture_extension(texture_path))
+                return true;
+        }
+    }
+    return false;
+}
+
+static fs::path first_existing_supported_texture_from_mtl(const fs::path &mtl_path)
+{
+    for (const std::string &texture : parse_mtl_texture_maps(mtl_path)) {
+        const fs::path texture_path = resolve_obj_asset_path(mtl_path, texture);
+        if (fs::exists(texture_path) && has_supported_texture_extension(texture_path))
+            return texture_path;
+    }
+    return {};
+}
+
+static bool write_obj_with_mtllib(const fs::path &source_obj, const fs::path &target_obj, const std::string &mtl_filename)
+{
+    std::ifstream in(source_obj.string());
+    std::ofstream out(target_obj.string(), std::ios::binary);
+    if (!in || !out)
+        return false;
+
+    bool wrote_mtllib = false;
+    for (std::string line; std::getline(in, line);) {
+        if (starts_with_obj_token(line, "mtllib")) {
+            if (!wrote_mtllib) {
+                out << "mtllib " << mtl_filename << '\n';
+                wrote_mtllib = true;
+            }
+            continue;
+        }
+        if (!wrote_mtllib && starts_with_obj_token(line, "o")) {
+            out << "mtllib " << mtl_filename << '\n';
+            wrote_mtllib = true;
+        }
+        out << line << '\n';
+    }
+    if (!wrote_mtllib)
+        out << "mtllib " << mtl_filename << '\n';
+    return true;
+}
+
+static bool write_mtl_with_texture(const fs::path &source_mtl, const fs::path &target_mtl, const std::string &texture_filename)
+{
+    std::ifstream in(source_mtl.string());
+    std::ofstream out(target_mtl.string(), std::ios::binary);
+    if (!in || !out)
+        return false;
+
+    bool wrote_texture = false;
+    for (std::string line; std::getline(in, line);) {
+        if (starts_with_obj_token(line, "map_Kd")) {
+            if (!wrote_texture) {
+                out << "map_Kd " << texture_filename << '\n';
+                wrote_texture = true;
+            }
+            continue;
+        }
+        out << line << '\n';
+    }
+    if (!wrote_texture)
+        out << "map_Kd " << texture_filename << '\n';
+    return true;
+}
+
+static std::vector<std::string> color_synthesis_filament_colours(ColorSynthesisMode mode)
+{
+    switch (mode) {
+    case ColorSynthesisMode::CMY:
+        return {"#00FFFFFF", "#FF00FFFF", "#FFFF00FF"};
+    case ColorSynthesisMode::CMYK:
+        return {"#00FFFFFF", "#FF00FFFF", "#FFFF00FF", "#000000FF"};
+    case ColorSynthesisMode::CMYW:
+        return {"#00FFFFFF", "#FF00FFFF", "#FFFF00FF", "#FFFFFFFF"};
+    case ColorSynthesisMode::Standard:
+    default:
+        return {};
+    }
+}
+
+static bool ensure_color_synthesis_filament_count(ColorSynthesisMode mode)
+{
+    const std::vector<std::string> colours = color_synthesis_filament_colours(mode);
+    PresetBundle *preset_bundle = wxGetApp().preset_bundle;
+    if (colours.empty() || !preset_bundle || preset_bundle->filament_presets.size() >= colours.size())
+        return false;
+
+    std::vector<std::string> added_colours;
+    added_colours.reserve(colours.size() - preset_bundle->filament_presets.size());
+    for (size_t idx = preset_bundle->filament_presets.size(); idx < colours.size(); ++idx)
+        added_colours.emplace_back(colours[idx]);
+
+    preset_bundle->set_num_filaments(unsigned(colours.size()), added_colours);
+    return true;
+}
+
+static bool apply_color_synthesis_filament_colours(DynamicPrintConfig &project_config, ColorSynthesisMode mode)
+{
+    const std::vector<std::string> colours = color_synthesis_filament_colours(mode);
+    ConfigOptionStrings *color_opt = project_config.option<ConfigOptionStrings>("filament_colour");
+    if (colours.empty() || !color_opt)
+        return false;
+
+    bool changed = false;
+    const size_t count = std::min(color_opt->values.size(), colours.size());
+    for (size_t idx = 0; idx < count; ++idx) {
+        if (color_opt->values[idx] == colours[idx])
+            continue;
+        color_opt->values[idx] = colours[idx];
+        changed = true;
+    }
+    return changed;
+}
+
+static ColorSynthesisMode project_color_synthesis_mode()
+{
+    const ConfigOption *mode_opt = wxGetApp().preset_bundle->project_config.option("color_synthesis_mode");
+    ColorSynthesisMode mode = ColorSynthesisMode::Standard;
+    if (mode_opt)
+        ConfigOptionEnum<ColorSynthesisMode>::from_string(mode_opt->serialize(), mode);
+    return mode;
+}
+
+static bool model_has_texture_derived_colors(const Model &model)
+{
+    for (const ModelObject *object : model.objects) {
+        if (object == nullptr)
+            continue;
+        for (const ModelVolume *volume : object->volumes)
+            if (volume != nullptr && volume->is_model_part() && volume->has_virtual_face_colors())
+                return true;
+    }
+    return false;
+}
+
+static fs::path ask_for_obj_color_import(wxWindow *parent, const fs::path &obj_path)
+{
+    (void)parent;
+    return obj_path;
+}
+
+} // namespace
 
 wxDEFINE_EVENT(EVT_SCHEDULE_BACKGROUND_PROCESS,     SimpleEvent);
 wxDEFINE_EVENT(EVT_SLICING_UPDATE,                  SlicingStatusEvent);
@@ -701,6 +945,7 @@ struct Sidebar::priv
     wxPanel* m_panel_filament_content;
     wxScrolledWindow* m_scrolledWindow_filament_content;
     wxStaticLine* m_staticline2;
+    wxWindow* m_color_synthesis_panel = nullptr;
     ComboBox* m_color_synthesis_combo = nullptr;
     std::vector<std::string> m_color_synthesis_enum_values;
     wxPanel* m_panel_project_title;
@@ -1632,6 +1877,7 @@ Sidebar::Sidebar(Plater *parent)
     sizer_filaments2->Add(p->sizer_filaments, 0, wxEXPAND, 0);
     {
         auto *mode_panel = new StaticBox(p->m_panel_filament_content, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxTAB_TRAVERSAL | wxBORDER_NONE);
+        p->m_color_synthesis_panel = mode_panel;
         mode_panel->SetCornerRadius(8);
 
         auto *mode_sizer = new wxBoxSizer(wxHORIZONTAL);
@@ -1671,8 +1917,23 @@ Sidebar::Sidebar(Plater *parent)
                 return;
 
             wxGetApp().preset_bundle->project_config.set_key_value("color_synthesis_mode", new ConfigOptionEnum<ColorSynthesisMode>(mode));
+            const bool filament_count_changed = ensure_color_synthesis_filament_count(mode);
+            apply_color_synthesis_filament_colours(wxGetApp().preset_bundle->project_config, mode);
             wxGetApp().preset_bundle->export_selections(*wxGetApp().app_config);
             wxGetApp().plater()->update_project_dirty_from_presets();
+
+            if (filament_count_changed) {
+                wxGetApp().plater()->on_filaments_change(color_synthesis_filament_colours(mode).size());
+                wxGetApp().get_tab(Preset::TYPE_PRINT)->update();
+            } else {
+                wxGetApp().plater()->update_filament_colors_in_full_config();
+                for (PlaterPresetComboBox *combo : p->combos_filament)
+                    if (combo)
+                        combo->update();
+                obj_list()->update_filament_colors();
+                update_dynamic_filament_list();
+            }
+
             wxPostEvent(parent, SimpleEvent(EVT_SCHEDULE_BACKGROUND_PROCESS, parent));
         });
 
@@ -1780,6 +2041,7 @@ Sidebar::Sidebar(Plater *parent)
     auto *sizer = new wxBoxSizer(wxVERTICAL);
     sizer->Add(p->scrolled, 1, wxEXPAND);
     SetSizer(sizer);
+    update_color_synthesis_visibility();
 }
 
 Sidebar::~Sidebar() {}
@@ -2768,6 +3030,35 @@ void Sidebar::show_SEMM_buttons(bool bshow)
         p->m_bpButton_del_filament->Show(bshow);
     if (p->m_flushing_volume_btn && p->combos_filament.size() > 1) // ORCA add filament count as condition to prevent showing Flushing volumes and Del Filament icon visible while only 1 filament exist
         p->m_flushing_volume_btn->Show(bshow);
+    Layout();
+}
+
+void Sidebar::update_color_synthesis_visibility()
+{
+    if (p->m_color_synthesis_panel == nullptr)
+        return;
+
+    const bool show = model_has_texture_derived_colors(p->plater->model());
+    if (!show && project_color_synthesis_mode() != ColorSynthesisMode::Standard) {
+        wxGetApp().preset_bundle->project_config.set_key_value("color_synthesis_mode", new ConfigOptionEnum<ColorSynthesisMode>(ColorSynthesisMode::Standard));
+        if (p->m_color_synthesis_combo)
+            p->m_color_synthesis_combo->Select(0);
+    }
+
+    if (p->m_color_synthesis_panel->IsShown() != show)
+        p->m_color_synthesis_panel->Show(show);
+
+    if (p->m_color_synthesis_combo) {
+        const ConfigOption *current_mode_opt = wxGetApp().preset_bundle->project_config.option("color_synthesis_mode");
+        const std::string current_mode = current_mode_opt ? current_mode_opt->serialize() : std::string("standard");
+        auto current_mode_it = std::find(p->m_color_synthesis_enum_values.begin(), p->m_color_synthesis_enum_values.end(), current_mode);
+        p->m_color_synthesis_combo->Select(current_mode_it == p->m_color_synthesis_enum_values.end() ? 0 : int(std::distance(p->m_color_synthesis_enum_values.begin(), current_mode_it)));
+    }
+
+    if (p->m_panel_filament_content)
+        p->m_panel_filament_content->Layout();
+    if (p->scrolled)
+        p->scrolled->Layout();
     Layout();
 }
 
@@ -5286,6 +5577,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                 std::vector<Preset *> project_presets;
                 bool                  is_xxx;
                 Semver                file_version;
+                const fs::path        model_import_path = ask_for_obj_color_import(q, path);
                 
                 //ObjImportColorFn obj_color_fun=nullptr;
                 auto obj_color_fun = [this, &path](std::vector<RGBA> &input_colors, bool is_single_color, std::vector<unsigned char> &filament_ids,
@@ -5349,7 +5641,7 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                         }, linear, angle, split_compound);
                 }else {
                     model = Slic3r::Model:: read_from_file(
-                    path.string(), nullptr, nullptr, strategy, &plate_data, &project_presets, &is_xxx, &file_version, nullptr,
+                    model_import_path.string(), &wxGetApp().preset_bundle->project_config, nullptr, strategy, &plate_data, &project_presets, &is_xxx, &file_version, nullptr,
                     [this, &dlg, real_filename, &progress_percent, &file_percent, INPUT_FILES_RATIO, total_files, i, &designer_model_id, &designer_country_code](int current, int total, bool &cancel, std::string &mode_id, std::string &code)
                     {
                             designer_model_id = mode_id;
@@ -5364,6 +5656,10 @@ std::vector<size_t> Plater::priv::load_files(const std::vector<fs::path>& input_
                             cancel        = !cont;
                     },
                     nullptr, 0, obj_color_fun);
+                    if (model_import_path != path) {
+                        for (ModelObject *model_object : model.objects)
+                            model_object->input_file = path.string();
+                    }
                 }
 
                 if (designer_model_id.empty() && boost::algorithm::iends_with(path.string(), ".stl")) {
@@ -6057,6 +6353,8 @@ void Plater::priv::object_list_changed()
     bool can_slice = !model.objects.empty() && !export_in_progress && model_fits && part_plate->has_printable_instances();
     BOOST_LOG_TRIVIAL(info) << __FUNCTION__ << boost::format(": can_slice %1%, model_fits= %2%, export_in_progress %3%, has_printable_instances %4% ")%can_slice %model_fits %export_in_progress %part_plate->has_printable_instances();
     main_frame->update_slice_print_status(MainFrame::eEventObjectUpdate, can_slice);
+
+    sidebar->update_color_synthesis_visibility();
 
     wxGetApp().params_panel()->notify_object_config_changed();
 }
@@ -7157,6 +7455,7 @@ void Plater::priv::reload_from_disk()
     // load one file at a time
     for (size_t i = 0; i < input_paths.size(); ++i) {
         const auto& path = input_paths[i].string();
+        const fs::path reload_import_path = ask_for_obj_color_import(q, fs::path(path));
         auto obj_color_fun = [this, &path](std::vector<RGBA> &input_colors, bool is_single_color, std::vector<unsigned char> &filament_ids, unsigned char &first_extruder_id) {
             if (!boost::iends_with(path, ".obj")) { return; }
             const std::vector<std::string> extruder_colours = wxGetApp().plater()->get_extruder_colors_from_plater_config();
@@ -7188,7 +7487,11 @@ void Plater::priv::reload_from_disk()
                 bool   is_split = wxGetApp().app_config->get_bool("is_split_compound");
                 new_model       = Model::read_from_step(path, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel, nullptr, nullptr, nullptr, linear, angle, is_split);
             }else {
-                new_model = Model::read_from_file(path, nullptr, nullptr, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel, &plate_data, &project_presets, nullptr, nullptr, nullptr, nullptr, nullptr, 0, obj_color_fun);
+                new_model = Model::read_from_file(reload_import_path.string(), &wxGetApp().preset_bundle->project_config, nullptr, LoadStrategy::AddDefaultInstances | LoadStrategy::LoadModel, &plate_data, &project_presets, nullptr, nullptr, nullptr, nullptr, nullptr, 0, obj_color_fun);
+                if (reload_import_path.string() != path) {
+                    for (ModelObject *model_object : new_model.objects)
+                        model_object->input_file = path;
+                }
             }
 
 
@@ -14593,6 +14896,8 @@ void Plater::on_bed_type_change(BedType bed_type)
 bool Plater::update_filament_colors_in_full_config()
 {
     DynamicPrintConfig& project_config = wxGetApp().preset_bundle->project_config;
+    apply_color_synthesis_filament_colours(project_config, project_color_synthesis_mode());
+
     ConfigOptionStrings* color_opt = project_config.option<ConfigOptionStrings>("filament_colour");
 
     p->config->option<ConfigOptionStrings>("filament_colour")->values = color_opt->values;

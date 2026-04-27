@@ -8,6 +8,10 @@
 #include "MutablePolygon.hpp"
 #include "format.hpp"
 
+#include <algorithm>
+#include <array>
+#include <limits>
+#include <stdexcept>
 #include <utility>
 #include <unordered_set>
 
@@ -1182,7 +1186,8 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
                                                                                       const std::vector<ExPolygons>                                   &input_expolygons,
                                                                                       const std::function<ModelVolumeFacetsInfo(const ModelVolume &)> &extract_facets_info,
                                                                                       const size_t                                                     num_facets_states,
-                                                                                      const std::function<void()>                                     &throw_on_cancel_callback)
+                                                                                      const std::function<void()>                                     &throw_on_cancel_callback,
+                                                                                      const std::vector<ModelVolume *>                                &model_volumes)
 {
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - Segmentation of top and bottom layers in parallel - Begin";
     const size_t num_layers    = input_expolygons.size();
@@ -1210,7 +1215,7 @@ static inline std::vector<std::vector<ExPolygons>> segmentation_top_and_bottom_l
 #endif // MM_SEGMENTATION_DEBUG_TOP_BOTTOM
 
     if (max_top_layers > 0 || max_bottom_layers > 0) {
-        for (const ModelVolume *mv : print_object.model_object()->volumes)
+        for (const ModelVolume *mv : model_volumes)
             if (mv->is_model_part()) {
                 const Transform3d volume_trafo = object_trafo * mv->get_matrix();
                 for (size_t extruder_idx = 0; extruder_idx < num_facets_states; ++extruder_idx) {
@@ -1553,6 +1558,9 @@ static MMU_Graph build_graph(size_t layer_idx, const std::vector<std::vector<Col
 
     Voronoi::VD vd;
     vd.construct_voronoi(colored_lines.begin(), colored_lines.end());
+    if (!vd.is_valid())
+        throw std::runtime_error("invalid Voronoi diagram after repair");
+
     // boost::polygon::construct_voronoi(lines_colored.begin(), lines_colored.end(), &vd);
     MMU_Graph graph;
     graph.nodes.reserve(points.size() + vd.vertices().size());
@@ -1952,6 +1960,27 @@ static bool has_layer_only_one_color(const std::vector<ColoredLines> &colored_po
     return true;
 }
 
+static int dominant_painted_color(const std::vector<ColoredLines> &colored_polygons, size_t num_facets_states)
+{
+    std::vector<double> score(num_facets_states, 0.);
+    for (const ColoredLines &colored_polygon : colored_polygons) {
+        for (const ColoredLine &colored_line : colored_polygon) {
+            if (colored_line.color > 0 && size_t(colored_line.color) < score.size())
+                score[size_t(colored_line.color)] += colored_line.line.length();
+        }
+    }
+
+    int best_color = 0;
+    double best_score = 0.;
+    for (size_t color = 1; color < score.size(); ++color) {
+        if (score[color] > best_score) {
+            best_score = score[color];
+            best_color = int(color);
+        }
+    }
+    return best_color;
+}
+
 std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject                                               &print_object,
                                                               const std::function<ModelVolumeFacetsInfo(const ModelVolume &)> &extract_facets_info,
                                                               const size_t                                                     num_facets_states,
@@ -1959,8 +1988,11 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                                                               const float                                                      segmentation_interlocking_depth,
                                                               const bool                                                       segmentation_interlocking_beam,
                                                               const IncludeTopAndBottomLayers                                  include_top_and_bottom_layers,
-                                                              const std::function<void()>                                     &throw_on_cancel_callback)
+                                                              const std::function<void()>                                     &throw_on_cancel_callback,
+                                                              LayerFacetColorFn                                                layer_facet_color,
+                                                              const std::vector<ModelVolume *>                                *model_volumes_override)
 {
+    const std::vector<ModelVolume *> &model_volumes = model_volumes_override ? *model_volumes_override : print_object.model_object()->volumes;
     const size_t                          num_layers    = print_object.layers().size();
     std::vector<std::vector<ExPolygons>>  segmented_regions(num_layers);
     segmented_regions.assign(num_layers, std::vector<ExPolygons>(num_facets_states));
@@ -2028,9 +2060,110 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
     }
 
     BOOST_LOG_TRIVIAL(debug) << "Print object segmentation - Projection of painted triangles - Begin";
-    for (const ModelVolume *mv : print_object.model_object()->volumes) {
+    const bool has_layer_facet_color = bool(layer_facet_color);
+    auto project_facet_to_layers = [&](std::array<Vec3f, 3> facet, auto &&color_for_layer) {
+        float min_z = std::numeric_limits<float>::max();
+        float max_z = std::numeric_limits<float>::lowest();
+        for (const Vec3f &point : facet) {
+            max_z = std::max(max_z, point.z());
+            min_z = std::min(min_z, point.z());
+        }
+
+        if (is_equal(min_z, max_z))
+            return;
+
+        // Sort the vertices by z-axis for simplification of projected_facet on slices
+        std::sort(facet.begin(), facet.end(), [](const Vec3f &p1, const Vec3f &p2) { return p1.z() < p2.z(); });
+
+        // Find lowest slice not below the triangle.
+        auto first_layer = std::upper_bound(layers.begin(), layers.end(), float(min_z - EPSILON),
+                                            [](float z, const Layer *l1) { return z < l1->slice_z; });
+        auto last_layer  = std::upper_bound(layers.begin(), layers.end(), float(max_z + EPSILON),
+                                           [](float z, const Layer *l1) { return z < l1->slice_z; });
+        if (first_layer == layers.end() || last_layer == layers.begin())
+            return;
+        --last_layer;
+        if (last_layer < first_layer)
+            return;
+
+        for (auto layer_it = first_layer; layer_it != (last_layer + 1); ++layer_it) {
+            const Layer *layer     = *layer_it;
+            size_t       layer_idx = layer_it - layers.begin();
+            const int    color     = color_for_layer(layer_idx);
+            if (color <= 0 || size_t(color) >= num_facets_states)
+                continue;
+
+            if (input_expolygons[layer_idx].empty() || is_less(layer->slice_z, facet[0].z()) || is_less(facet[2].z(), layer->slice_z))
+                continue;
+
+            // https://kandepet.com/3d-printing-slicing-3d-objects/
+            float t            = (float(layer->slice_z) - facet[0].z()) / (facet[2].z() - facet[0].z());
+            Vec3f line_start_f = facet[0] + t * (facet[2] - facet[0]);
+            Vec3f line_end_f;
+
+            // BBS: When one side of a triangle coincides with the slice_z.
+            if ((is_equal(facet[0].z(), facet[1].z()) && is_equal(facet[1].z(), layer->slice_z))
+                || (is_equal(facet[1].z(), facet[2].z()) && is_equal(facet[1].z(), layer->slice_z))) {
+                line_end_f = facet[1];
+            }
+            else if (facet[1].z() > layer->slice_z) {
+                // [P0, P2] and [P0, P1]
+                float t1   = (float(layer->slice_z) - facet[0].z()) / (facet[1].z() - facet[0].z());
+                line_end_f = facet[0] + t1 * (facet[1] - facet[0]);
+            } else {
+                // [P0, P2] and [P1, P2]
+                float t2   = (float(layer->slice_z) - facet[1].z()) / (facet[2].z() - facet[1].z());
+                line_end_f = facet[1] + t2 * (facet[2] - facet[1]);
+            }
+
+            Line line_to_test(Point(scale_(line_start_f.x()), scale_(line_start_f.y())),
+                              Point(scale_(line_end_f.x()), scale_(line_end_f.y())));
+            line_to_test.translate(-print_object.center_offset());
+
+            // BoundingBoxes for EdgeGrids are computed from printable regions. It is possible that the painted line (line_to_test) could
+            // be outside EdgeGrid's BoundingBox, for example, when the negative volume is used on the painted area (GH #7618).
+            // To ensure that the painted line is always inside EdgeGrid's BoundingBox, it is clipped by EdgeGrid's BoundingBox in cases
+            // when any of the endpoints of the line are outside the EdgeGrid's BoundingBox.
+            BoundingBox edge_grid_bbox = edge_grids[layer_idx].bbox();
+            edge_grid_bbox.offset(10 * scale_(EPSILON));
+            if (!edge_grid_bbox.contains(line_to_test.a) || !edge_grid_bbox.contains(line_to_test.b)) {
+                // If the painted line (line_to_test) is entirely outside EdgeGrid's BoundingBox, skip this painted line.
+                if (!edge_grid_bbox.overlap(BoundingBox(Points{line_to_test.a, line_to_test.b})) ||
+                    !line_to_test.clip_with_bbox(edge_grid_bbox))
+                    continue;
+            }
+
+            size_t mutex_idx = layer_idx & 0x3F;
+            assert(mutex_idx < painted_lines_mutex.size());
+
+            PaintedLineVisitor visitor(edge_grids[layer_idx], painted_lines[layer_idx], painted_lines_mutex[mutex_idx], 16);
+            visitor.line_to_test = line_to_test;
+            visitor.color        = color;
+            edge_grids[layer_idx].visit_cells_intersecting_line(line_to_test.a, line_to_test.b, visitor);
+        }
+    };
+
+    for (const ModelVolume *mv : model_volumes) {
+        if (has_layer_facet_color && mv->has_virtual_face_colors() && mv->is_model_part()) {
+            const indexed_triangle_set &its = mv->mesh().its;
+            const size_t face_count = std::min(its.indices.size(), mv->virtual_face_colors.size());
+            const Transform3f tr = print_object.trafo().cast<float>() * mv->get_matrix().cast<float>();
+            tbb::parallel_for(tbb::blocked_range<size_t>(0, face_count), [&mv, &its, &tr, &project_facet_to_layers, &layer_facet_color](const tbb::blocked_range<size_t> &range) {
+                for (size_t facet_idx = range.begin(); facet_idx < range.end(); ++facet_idx) {
+                    const stl_triangle_vertex_indices &face = its.indices[facet_idx];
+                    std::array<Vec3f, 3> facet;
+                    for (int p_idx = 0; p_idx < 3; ++p_idx)
+                        facet[p_idx] = tr * its.vertices[face[p_idx]];
+                    project_facet_to_layers(facet, [&layer_facet_color, mv, facet_idx](size_t layer_idx) {
+                        return layer_facet_color(*mv, facet_idx, layer_idx);
+                    });
+                }
+            });
+            continue;
+        }
+
         const ModelVolumeFacetsInfo facets_info = extract_facets_info(*mv);
-        tbb::parallel_for(tbb::blocked_range<size_t>(1, num_facets_states), [&mv, &print_object, &facets_info, &layers, &edge_grids, &painted_lines, &painted_lines_mutex, &input_expolygons, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
+        tbb::parallel_for(tbb::blocked_range<size_t>(1, num_facets_states), [&mv, &facets_info, &print_object, &project_facet_to_layers, &throw_on_cancel_callback](const tbb::blocked_range<size_t> &range) {
             for (size_t extruder_idx = range.begin(); extruder_idx < range.end(); ++extruder_idx) {
                 throw_on_cancel_callback();
                 const indexed_triangle_set custom_facets = facets_info.facets_annotation.get_facets(*mv, EnforcerBlockerType(extruder_idx));
@@ -2038,82 +2171,12 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                     continue;
 
                 const Transform3f tr = print_object.trafo().cast<float>() * mv->get_matrix().cast<float>();
-                tbb::parallel_for(tbb::blocked_range<size_t>(0, custom_facets.indices.size()), [&tr, &custom_facets, &print_object, &layers, &edge_grids, &input_expolygons, &painted_lines, &painted_lines_mutex, &extruder_idx](const tbb::blocked_range<size_t> &range) {
+                tbb::parallel_for(tbb::blocked_range<size_t>(0, custom_facets.indices.size()), [&tr, &custom_facets, &project_facet_to_layers, &extruder_idx](const tbb::blocked_range<size_t> &range) {
                     for (size_t facet_idx = range.begin(); facet_idx < range.end(); ++facet_idx) {
-                        float min_z = std::numeric_limits<float>::max();
-                        float max_z = std::numeric_limits<float>::lowest();
-
                         std::array<Vec3f, 3> facet;
-                        for (int p_idx = 0; p_idx < 3; ++p_idx) {
+                        for (int p_idx = 0; p_idx < 3; ++p_idx)
                             facet[p_idx] = tr * custom_facets.vertices[custom_facets.indices[facet_idx](p_idx)];
-                            max_z        = std::max(max_z, facet[p_idx].z());
-                            min_z        = std::min(min_z, facet[p_idx].z());
-                        }
-
-                        if (is_equal(min_z, max_z))
-                            continue;
-
-                        // Sort the vertices by z-axis for simplification of projected_facet on slices
-                        std::sort(facet.begin(), facet.end(), [](const Vec3f &p1, const Vec3f &p2) { return p1.z() < p2.z(); });
-
-                        // Find lowest slice not below the triangle.
-                        auto first_layer = std::upper_bound(layers.begin(), layers.end(), float(min_z - EPSILON),
-                                                            [](float z, const Layer *l1) { return z < l1->slice_z; });
-                        auto last_layer  = std::upper_bound(layers.begin(), layers.end(), float(max_z + EPSILON),
-                                                           [](float z, const Layer *l1) { return z < l1->slice_z; });
-                        --last_layer;
-
-                        for (auto layer_it = first_layer; layer_it != (last_layer + 1); ++layer_it) {
-                            const Layer *layer     = *layer_it;
-                            size_t       layer_idx = layer_it - layers.begin();
-                            if (input_expolygons[layer_idx].empty() || is_less(layer->slice_z, facet[0].z()) || is_less(facet[2].z(), layer->slice_z))
-                                continue;
-
-                            // https://kandepet.com/3d-printing-slicing-3d-objects/
-                            float t            = (float(layer->slice_z) - facet[0].z()) / (facet[2].z() - facet[0].z());
-                            Vec3f line_start_f = facet[0] + t * (facet[2] - facet[0]);
-                            Vec3f line_end_f;
-
-                            // BBS: When one side of a triangle coincides with the slice_z.
-                            if ((is_equal(facet[0].z(), facet[1].z()) && is_equal(facet[1].z(), layer->slice_z))
-                                || (is_equal(facet[1].z(), facet[2].z()) && is_equal(facet[1].z(), layer->slice_z))) {
-                                line_end_f = facet[1];
-                            }
-                            else if (facet[1].z() > layer->slice_z) {
-                                // [P0, P2] and [P0, P1]
-                                float t1   = (float(layer->slice_z) - facet[0].z()) / (facet[1].z() - facet[0].z());
-                                line_end_f = facet[0] + t1 * (facet[1] - facet[0]);
-                            } else {
-                                // [P0, P2] and [P1, P2]
-                                float t2   = (float(layer->slice_z) - facet[1].z()) / (facet[2].z() - facet[1].z());
-                                line_end_f = facet[1] + t2 * (facet[2] - facet[1]);
-                            }
-
-                            Line line_to_test(Point(scale_(line_start_f.x()), scale_(line_start_f.y())),
-                                              Point(scale_(line_end_f.x()), scale_(line_end_f.y())));
-                            line_to_test.translate(-print_object.center_offset());
-
-                            // BoundingBoxes for EdgeGrids are computed from printable regions. It is possible that the painted line (line_to_test) could
-                            // be outside EdgeGrid's BoundingBox, for example, when the negative volume is used on the painted area (GH #7618).
-                            // To ensure that the painted line is always inside EdgeGrid's BoundingBox, it is clipped by EdgeGrid's BoundingBox in cases
-                            // when any of the endpoints of the line are outside the EdgeGrid's BoundingBox.
-                            BoundingBox edge_grid_bbox = edge_grids[layer_idx].bbox();
-                            edge_grid_bbox.offset(10 * scale_(EPSILON));
-                            if (!edge_grid_bbox.contains(line_to_test.a) || !edge_grid_bbox.contains(line_to_test.b)) {
-                                // If the painted line (line_to_test) is entirely outside EdgeGrid's BoundingBox, skip this painted line.
-                                if (!edge_grid_bbox.overlap(BoundingBox(Points{line_to_test.a, line_to_test.b})) ||
-                                    !line_to_test.clip_with_bbox(edge_grid_bbox))
-                                    continue;
-                            }
-
-                            size_t mutex_idx = layer_idx & 0x3F;
-                            assert(mutex_idx < painted_lines_mutex.size());
-
-                            PaintedLineVisitor visitor(edge_grids[layer_idx], painted_lines[layer_idx], painted_lines_mutex[mutex_idx], 16);
-                            visitor.line_to_test = line_to_test;
-                            visitor.color        = int(extruder_idx);
-                            edge_grids[layer_idx].visit_cells_intersecting_line(line_to_test.a, line_to_test.b, visitor);
-                        }
+                        project_facet_to_layers(facet, [extruder_idx](size_t) { return int(extruder_idx); });
                     }
                 }); // end of parallel_for
             }
@@ -2150,11 +2213,19 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
                     // If the whole layer is painted using the same color, it is not needed to construct a Voronoi diagram for the segmentation of this layer.
                     segmented_regions[layer_idx][size_t(color_poly.front().front().color)] = input_expolygons[layer_idx];
                 } else {
-                    MMU_Graph graph = build_graph(layer_idx, color_poly);
-                    remove_multiple_edges_in_vertices(graph, color_poly);
-                    graph.remove_nodes_with_one_arc();
-                    segmented_regions[layer_idx] = extract_colored_segments(graph, num_facets_states);
-                    //segmented_regions[layer_idx] = extract_colored_segments(color_poly, num_extruders, layer_idx);
+                    try {
+                        MMU_Graph graph = build_graph(layer_idx, color_poly);
+                        remove_multiple_edges_in_vertices(graph, color_poly);
+                        graph.remove_nodes_with_one_arc();
+                        segmented_regions[layer_idx] = extract_colored_segments(graph, num_facets_states);
+                        //segmented_regions[layer_idx] = extract_colored_segments(color_poly, num_extruders, layer_idx);
+                    } catch (const std::exception &e) {
+                        const int fallback_color = dominant_painted_color(color_poly, num_facets_states);
+                        BOOST_LOG_TRIVIAL(warning) << "Print object segmentation - falling back to dominant color on layer "
+                                                   << layer_idx << ": " << e.what();
+                        if (fallback_color > 0)
+                            segmented_regions[layer_idx][size_t(fallback_color)] = input_expolygons[layer_idx];
+                    }
                 }
 
 #ifdef MM_SEGMENTATION_DEBUG_REGIONS
@@ -2174,7 +2245,7 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
     // The first index is extruder number (includes default extruder), and the second one is layer number
     std::vector<std::vector<ExPolygons>> top_and_bottom_layers;
     if (include_top_and_bottom_layers == IncludeTopAndBottomLayers::Yes) {
-        top_and_bottom_layers = segmentation_top_and_bottom_layers(print_object, input_expolygons, extract_facets_info, num_facets_states, throw_on_cancel_callback);
+        top_and_bottom_layers = segmentation_top_and_bottom_layers(print_object, input_expolygons, extract_facets_info, num_facets_states, throw_on_cancel_callback, model_volumes);
         throw_on_cancel_callback();
     }
 
@@ -2194,8 +2265,12 @@ std::vector<std::vector<ExPolygons>> segmentation_by_painting(const PrintObject 
 }
 
 // Returns multi-material segmentation based on painting in multi-material segmentation gizmo
-std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(const PrintObject &print_object, const std::function<void()> &throw_on_cancel_callback) {
-    const size_t num_facets_states  = print_object.print()->config().filament_colour.size() + 1;
+std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(const PrintObject &print_object,
+                                                                              const std::function<void()> &throw_on_cancel_callback,
+                                                                              const std::vector<ModelVolume *> *model_volumes_override,
+                                                                              IncludeTopAndBottomLayers include_top_and_bottom_layers) {
+    const size_t num_facets_states  = std::max(print_object.print()->config().filament_colour.size(),
+                                               print_object.print()->config().filament_diameter.size()) + 1;
     const float  max_width          = float(print_object.config().mmu_segmented_region_max_width.value);
     const float  interlocking_depth = float(print_object.config().mmu_segmented_region_interlocking_depth.value);
     const bool   interlocking_beam  = print_object.config().interlocking_beam.value;
@@ -2204,7 +2279,7 @@ std::vector<std::vector<ExPolygons>> multi_material_segmentation_by_painting(con
         return {mv.mmu_segmentation_facets, mv.is_mm_painted(), false};
     };
 
-    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, interlocking_beam, IncludeTopAndBottomLayers::Yes, throw_on_cancel_callback);
+    return segmentation_by_painting(print_object, extract_facets_info, num_facets_states, max_width, interlocking_depth, interlocking_beam, include_top_and_bottom_layers, throw_on_cancel_callback, {}, model_volumes_override);
 }
 
 // Returns fuzzy skin segmentation based on painting in fuzzy skin segmentation gizmo

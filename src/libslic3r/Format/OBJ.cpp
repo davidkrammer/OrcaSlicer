@@ -7,12 +7,14 @@
 #include "objparser.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <iterator>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <boost/filesystem.hpp>
 #include <boost/log/trivial.hpp>
@@ -41,6 +43,57 @@ static std::string resolve_obj_asset_path(const char *obj_path, const std::strin
     return (full_obj_path.parent_path() / texture_path).string();
 }
 
+static std::string lower_extension(boost::filesystem::path path)
+{
+    std::string ext = path.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    return ext;
+}
+
+static bool extension_matches(const boost::filesystem::path &path, const std::vector<std::string> &extensions)
+{
+    const std::string ext = lower_extension(path);
+    return std::find(extensions.begin(), extensions.end(), ext) != extensions.end();
+}
+
+static boost::filesystem::path fallback_obj_asset_path(const char *obj_path, const boost::filesystem::path &requested_path, const std::vector<std::string> &extensions)
+{
+    const boost::filesystem::path full_obj_path(obj_path);
+    const boost::filesystem::path dir = full_obj_path.parent_path();
+    if (dir.empty() || !boost::filesystem::exists(dir))
+        return {};
+
+    if (!requested_path.extension().empty()) {
+        boost::filesystem::path same_stem = dir / full_obj_path.stem();
+        same_stem.replace_extension(requested_path.extension());
+        if (boost::filesystem::exists(same_stem))
+            return same_stem;
+    }
+
+    boost::filesystem::path only_match;
+    size_t match_count = 0;
+    for (const boost::filesystem::directory_entry &entry : boost::filesystem::directory_iterator(dir)) {
+        if (!boost::filesystem::is_regular_file(entry.status()) || !extension_matches(entry.path(), extensions))
+            continue;
+        only_match = entry.path();
+        ++match_count;
+        if (match_count > 1)
+            return {};
+    }
+
+    return match_count == 1 ? only_match : boost::filesystem::path{};
+}
+
+static std::string resolve_existing_obj_asset_path(const char *obj_path, const std::string &asset_path, const std::vector<std::string> &fallback_extensions)
+{
+    const boost::filesystem::path resolved_path(resolve_obj_asset_path(obj_path, asset_path));
+    if (boost::filesystem::exists(resolved_path))
+        return resolved_path.string();
+
+    const boost::filesystem::path fallback_path = fallback_obj_asset_path(obj_path, resolved_path, fallback_extensions);
+    return fallback_path.empty() ? resolved_path.string() : fallback_path.string();
+}
+
 static bool load_png_texture(const std::string &texture_path, png::ImageColorscale &image)
 {
     if (!boost::filesystem::exists(texture_path))
@@ -50,7 +103,7 @@ static bool load_png_texture(const std::string &texture_path, png::ImageColorsca
     if (!texture_file)
         return false;
 
-    std::vector<char> buffer(std::istreambuf_iterator<char>(texture_file), std::istreambuf_iterator<char>());
+    std::vector<char> buffer{std::istreambuf_iterator<char>(texture_file), std::istreambuf_iterator<char>()};
     if (buffer.empty())
         return false;
 
@@ -119,16 +172,25 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
                 boost::filesystem::path temp_mtl_path(mtl_file);
                 mtl_path = temp_mtl_path;
             }
-            auto    _mtl_path = mtl_name_is_path ? mtl_abs_path.string().c_str() : mtl_path.string().c_str();
-            if (boost::filesystem::exists(mtl_name_is_path ? mtl_abs_path : mtl_path)) {
-                if (!ObjParser::mtlparse(_mtl_path, mtl_data)) {
-                    BOOST_LOG_TRIVIAL(error) << "load_obj:load_mtl: failed to parse " << _mtl_path;
+            boost::filesystem::path resolved_mtl_path = mtl_name_is_path ? mtl_abs_path : mtl_path;
+            if (!boost::filesystem::exists(resolved_mtl_path)) {
+                const boost::filesystem::path fallback_mtl_path = fallback_obj_asset_path(path, resolved_mtl_path, {".mtl"});
+                if (!fallback_mtl_path.empty()) {
+                    BOOST_LOG_TRIVIAL(info) << "load_obj: using fallback mtl_path:" << fallback_mtl_path.string();
+                    resolved_mtl_path = fallback_mtl_path;
+                }
+            }
+
+            if (boost::filesystem::exists(resolved_mtl_path)) {
+                const std::string resolved_mtl_path_string = resolved_mtl_path.string();
+                if (!ObjParser::mtlparse(resolved_mtl_path_string.c_str(), mtl_data)) {
+                    BOOST_LOG_TRIVIAL(error) << "load_obj:load_mtl: failed to parse " << resolved_mtl_path_string;
                     message = _L("load mtl in obj: failed to parse");
                     return false;
                 }
             }
             else {
-                BOOST_LOG_TRIVIAL(error) << "load_obj: failed to load mtl_path:" << _mtl_path;
+                BOOST_LOG_TRIVIAL(error) << "load_obj: failed to load mtl_path:" << resolved_mtl_path.string();
             }
         }
     }
@@ -163,7 +225,6 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
     its.vertices.reserve(num_vertices);
     its.indices.reserve(num_faces + num_quads);
     if (exist_mtl) {
-        obj_info.is_single_mtl = data.usemtls.size() == 1 && mtl_data.new_mtl_unmap.size() == 1;
         obj_info.face_colors.reserve(num_faces + num_quads);
     }
     bool has_color = data.has_vertex_color;
@@ -213,7 +274,7 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
                         if (uv_index < 0 || size_t(uv_index * 2 + 1) >= data.textureCoordinates.size())
                             return false;
 
-                    const std::string texture_path = resolve_obj_asset_path(path, texture_name);
+                    const std::string texture_path = resolve_existing_obj_asset_path(path, texture_name, {".png", ".jpg", ".jpeg"});
                     if (failed_texture_cache.find(texture_path) != failed_texture_cache.end())
                         return false;
 
@@ -304,6 +365,13 @@ bool load_obj(const char *path, TriangleMesh *meshptr, ObjInfo& obj_info, std::s
                 }
             }
         }
+
+    if (!obj_info.face_colors.empty()) {
+        const RGBA first_color = obj_info.face_colors.front();
+        obj_info.is_single_mtl = std::all_of(obj_info.face_colors.begin() + 1, obj_info.face_colors.end(), [&first_color](const RGBA &color) {
+            return color_is_equal(first_color, color);
+        });
+    }
 
     *meshptr = TriangleMesh(std::move(its));
     if (meshptr->empty()) {

@@ -14,6 +14,8 @@
 
 #include "bbs_3mf.hpp"
 
+#include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <iomanip>
@@ -277,11 +279,67 @@ static constexpr const char* CUSTOM_SUPPORTS_ATTR = "paint_supports";
 static constexpr const char* CUSTOM_FUZZY_SKIN_ATTR  = "paint_fuzzy_skin";
 static constexpr const char* CUSTOM_SEAM_ATTR = "paint_seam";
 static constexpr const char* MMU_SEGMENTATION_ATTR = "paint_color";
+static constexpr const char* VIRTUAL_FACE_COLOR_ATTR = "paint_virtual_color";
 // BBS
 static constexpr const char* FACE_PROPERTY_ATTR = "face_property";
 
 static constexpr const char* KEY_ATTR = "key";
 static constexpr const char* VALUE_ATTR = "value";
+
+static unsigned char virtual_color_byte(float value)
+{
+    return static_cast<unsigned char>(std::clamp(value, 0.f, 1.f) * 255.f + 0.5f);
+}
+
+static std::string encode_virtual_face_color(const Slic3r::RGBA &color)
+{
+    char buf[9];
+    ::snprintf(buf, sizeof(buf), "%02X%02X%02X%02X",
+        virtual_color_byte(color[0]),
+        virtual_color_byte(color[1]),
+        virtual_color_byte(color[2]),
+        virtual_color_byte(color[3]));
+    return buf;
+}
+
+static bool decode_hex_byte(const std::string &text, size_t offset, unsigned char &value)
+{
+    auto hex_value = [](char ch) -> int {
+        if (ch >= '0' && ch <= '9')
+            return ch - '0';
+        if (ch >= 'A' && ch <= 'F')
+            return 10 + ch - 'A';
+        if (ch >= 'a' && ch <= 'f')
+            return 10 + ch - 'a';
+        return -1;
+    };
+
+    const int high = hex_value(text[offset]);
+    const int low = hex_value(text[offset + 1]);
+    if (high < 0 || low < 0)
+        return false;
+
+    value = static_cast<unsigned char>((high << 4) | low);
+    return true;
+}
+
+static bool decode_virtual_face_color(const std::string &text, Slic3r::RGBA &color)
+{
+    if (text.size() != 6 && text.size() != 8)
+        return false;
+
+    unsigned char r = 0;
+    unsigned char g = 0;
+    unsigned char b = 0;
+    unsigned char a = 255;
+    if (!decode_hex_byte(text, 0, r) || !decode_hex_byte(text, 2, g) || !decode_hex_byte(text, 4, b))
+        return false;
+    if (text.size() == 8 && !decode_hex_byte(text, 6, a))
+        return false;
+
+    color = { float(r) / 255.f, float(g) / 255.f, float(b) / 255.f, float(a) / 255.f };
+    return true;
+}
 static constexpr const char* FIRST_TRIANGLE_ID_ATTR = "firstid";
 static constexpr const char* LAST_TRIANGLE_ID_ATTR = "lastid";
 static constexpr const char* SUBTYPE_ATTR = "subtype";
@@ -663,6 +721,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             std::vector<std::string> custom_seam;
             std::vector<std::string> mmu_segmentation;
             std::vector<std::string> fuzzy_skin;
+            std::vector<std::string> virtual_face_colors;
             // BBS
             std::vector<std::string> face_properties;
 
@@ -674,6 +733,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 std::swap(triangles, o.triangles);
                 std::swap(custom_supports, o.custom_supports);
                 std::swap(custom_seam, o.custom_seam);
+                std::swap(mmu_segmentation, o.mmu_segmentation);
+                std::swap(fuzzy_skin, o.fuzzy_skin);
+                std::swap(virtual_face_colors, o.virtual_face_colors);
+                std::swap(face_properties, o.face_properties);
             }
 
             void reset() {
@@ -683,6 +746,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 custom_seam.clear();
                 mmu_segmentation.clear();
                 fuzzy_skin.clear();
+                virtual_face_colors.clear();
+                face_properties.clear();
             }
         };
 
@@ -3606,6 +3671,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             m_curr_object->geometry.custom_seam.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
             m_curr_object->geometry.mmu_segmentation.push_back(bbs_get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
             m_curr_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_FUZZY_SKIN_ATTR));
+            m_curr_object->geometry.virtual_face_colors.push_back(bbs_get_attribute_value_string(attributes, num_attributes, VIRTUAL_FACE_COLOR_ATTR));
             // BBS
             m_curr_object->geometry.face_properties.push_back(bbs_get_attribute_value_string(attributes, num_attributes, FACE_PROPERTY_ATTR));
         }
@@ -4769,11 +4835,15 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 volume->seam_facets.reserve(triangles_count);
                 volume->mmu_segmentation_facets.reserve(triangles_count);
                 volume->fuzzy_skin_facets.reserve(triangles_count);
+                std::vector<RGBA> virtual_face_colors;
+                virtual_face_colors.reserve(triangles_count);
+                bool has_virtual_face_colors = false;
                 for (size_t i=0; i<triangles_count; ++i) {
                     assert(i < sub_object->geometry.custom_supports.size());
                     assert(i < sub_object->geometry.custom_seam.size());
                     assert(i < sub_object->geometry.mmu_segmentation.size());
                     assert(i < sub_object->geometry.fuzzy_skin.size());
+                    assert(i < sub_object->geometry.virtual_face_colors.size());
                     if (! sub_object->geometry.custom_supports[i].empty())
                         volume->supported_facets.set_triangle_from_string(i, sub_object->geometry.custom_supports[i]);
                     if (! sub_object->geometry.custom_seam[i].empty())
@@ -4782,6 +4852,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                         volume->mmu_segmentation_facets.set_triangle_from_string(i, sub_object->geometry.mmu_segmentation[i]);
                     if (!sub_object->geometry.fuzzy_skin[i].empty())
                         volume->fuzzy_skin_facets.set_triangle_from_string(i, sub_object->geometry.fuzzy_skin[i]);
+                    RGBA color = {1.f, 1.f, 1.f, 1.f};
+                    if (!sub_object->geometry.virtual_face_colors[i].empty() && decode_virtual_face_color(sub_object->geometry.virtual_face_colors[i], color))
+                        has_virtual_face_colors = true;
+                    virtual_face_colors.emplace_back(color);
                 }
                 volume->supported_facets.shrink_to_fit();
                 volume->seam_facets.shrink_to_fit();
@@ -4789,6 +4863,10 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                 volume->mmu_segmentation_facets.touch();
                 volume->fuzzy_skin_facets.shrink_to_fit();
                 volume->fuzzy_skin_facets.touch();
+                if (has_virtual_face_colors && virtual_face_colors.size() == triangles_count) {
+                    volume->virtual_face_colors = std::move(virtual_face_colors);
+                    volume->invalidate_color_synthesis_facets();
+                }
             }
 
             volume->set_type(volume_data->part_type);
@@ -4930,21 +5008,33 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             volume->supported_facets.reserve(triangles_count);
             volume->seam_facets.reserve(triangles_count);
             volume->mmu_segmentation_facets.reserve(triangles_count);
+            std::vector<RGBA> virtual_face_colors;
+            virtual_face_colors.reserve(triangles_count);
+            bool has_virtual_face_colors = false;
             for (size_t i=0; i<triangles_count; ++i) {
                 size_t index = volume_data.first_triangle_id + i;
                 assert(index < geometry.custom_supports.size());
                 assert(index < geometry.custom_seam.size());
                 assert(index < geometry.mmu_segmentation.size());
+                assert(index < geometry.virtual_face_colors.size());
                 if (! geometry.custom_supports[index].empty())
                     volume->supported_facets.set_triangle_from_string(i, geometry.custom_supports[index]);
                 if (! geometry.custom_seam[index].empty())
                     volume->seam_facets.set_triangle_from_string(i, geometry.custom_seam[index]);
                 if (! geometry.mmu_segmentation[index].empty())
                     volume->mmu_segmentation_facets.set_triangle_from_string(i, geometry.mmu_segmentation[index]);
+                RGBA color = {1.f, 1.f, 1.f, 1.f};
+                if (!geometry.virtual_face_colors[index].empty() && decode_virtual_face_color(geometry.virtual_face_colors[index], color))
+                    has_virtual_face_colors = true;
+                virtual_face_colors.emplace_back(color);
             }
             volume->supported_facets.shrink_to_fit();
             volume->seam_facets.shrink_to_fit();
             volume->mmu_segmentation_facets.shrink_to_fit();
+            if (has_virtual_face_colors && virtual_face_colors.size() == triangles_count) {
+                volume->virtual_face_colors = std::move(virtual_face_colors);
+                volume->invalidate_color_synthesis_facets();
+            }
 
             volume->set_type(volume_data.part_type);
 
@@ -5248,6 +5338,7 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
             current_object->geometry.custom_seam.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_SEAM_ATTR));
             current_object->geometry.mmu_segmentation.push_back(bbs_get_attribute_value_string(attributes, num_attributes, MMU_SEGMENTATION_ATTR));
             current_object->geometry.fuzzy_skin.push_back(bbs_get_attribute_value_string(attributes, num_attributes, CUSTOM_FUZZY_SKIN_ATTR));
+            current_object->geometry.virtual_face_colors.push_back(bbs_get_attribute_value_string(attributes, num_attributes, VIRTUAL_FACE_COLOR_ATTR));
             // BBS
             current_object->geometry.face_properties.push_back(bbs_get_attribute_value_string(attributes, num_attributes, FACE_PROPERTY_ATTR));
         }
@@ -6628,7 +6719,8 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                                 if ((shared_volume->supported_facets.equals(volume->supported_facets))
                                     && (shared_volume->seam_facets.equals(volume->seam_facets))
                                     && (shared_volume->mmu_segmentation_facets.equals(volume->mmu_segmentation_facets))
-                                    && (shared_volume->fuzzy_skin_facets.equals(volume->fuzzy_skin_facets)))
+                                    && (shared_volume->fuzzy_skin_facets.equals(volume->fuzzy_skin_facets))
+                                    && (shared_volume->virtual_face_colors == volume->virtual_face_colors))
                                 {
                                     auto data = iter->second.first;
                                     const_cast<_BBS_3MF_Exporter *>(this)->m_volume_paths.insert({volume, {data->sub_path, data->volumes_objectID.find(iter->second.second)->second}});
@@ -7040,6 +7132,14 @@ void PlateData::parse_filament_info(GCodeProcessorResult *result)
                     output_buffer += CUSTOM_FUZZY_SKIN_ATTR;
                     output_buffer += "=\"";
                     output_buffer += fuzzy_skin_painting_data_string;
+                    output_buffer += "\"";
+                }
+
+                if (volume->has_virtual_face_colors()) {
+                    output_buffer += " ";
+                    output_buffer += VIRTUAL_FACE_COLOR_ATTR;
+                    output_buffer += "=\"";
+                    output_buffer += encode_virtual_face_color(volume->virtual_face_colors[i]);
                     output_buffer += "\"";
                 }
 
