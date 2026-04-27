@@ -57,6 +57,8 @@ APP_BUNDLE_ID="${APP_BUNDLE_ID:-com.davidkrammer.snapmaker-orca-color}"
 DOWNLOADS_APP="$DOWNLOADS_DIR/$APP_DISPLAY_NAME.app"
 DOWNLOADS_BIN="$DOWNLOADS_APP/Contents/MacOS/Snapmaker_Orca"
 DOWNLOADS_FRAMEWORKS="$DOWNLOADS_APP/Contents/Frameworks"
+DOWNLOADS_RESOURCES="$DOWNLOADS_APP/Contents/Resources"
+SOURCE_RESOURCES="$PROJECT_DIR/resources"
 ZSTD_DYLIB="${ZSTD_DYLIB:-/opt/homebrew/opt/zstd/lib/libzstd.1.dylib}"
 
 if [[ ! -f "$BUILD_DIR/CMakeCache.txt" ]]; then
@@ -87,6 +89,7 @@ if [[ "$REFRESH_BUNDLE" == "1" || ! -d "$DOWNLOADS_APP" ]]; then
 fi
 
 cp "$BUILT_BIN" "$DOWNLOADS_BIN"
+ditto --norsrc "$SOURCE_RESOURCES" "$DOWNLOADS_RESOURCES"
 if [[ -f "$ZSTD_DYLIB" ]]; then
     mkdir -p "$DOWNLOADS_FRAMEWORKS"
     cp "$ZSTD_DYLIB" "$DOWNLOADS_FRAMEWORKS/libzstd.1.dylib"

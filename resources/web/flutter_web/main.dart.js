@@ -36941,7 +36941,7 @@ if(J.at(m)!==0)h=J.qM(h,m)
 if(J.at(h)===0){f=A.ap("gcode is empty")
 throw A.f(f)}A.d(B.f,"[LavaDeviceVM] setPrePrintConfiguration gcode: "+A.c(h),!0)
 s=7
-return A.e(A.o0(a,h,!0,3),$async$a5H)
+return A.e(A.o0(a,h,!0,10),$async$a5H)
 case 7:f=a1
 q=f
 s=1
@@ -134011,7 +134011,7 @@ return A.e(n.wc(),$async$mL)
 case 3:if(!c)throw A.f(A.ap("\u8bbe\u5907\u672a\u8fde\u63a5\u6216\u7528\u6237\u53d6\u6d88\u64cd\u4f5c"))
 p=5
 m=new A.b_0($.dL().aU(),a)
-l=n.Q===B.bv?10:3
+l=30
 s=8
 return A.e(n.b.ex(m,0,l),$async$mL)
 case 8:k=c
